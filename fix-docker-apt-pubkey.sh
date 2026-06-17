@@ -21,11 +21,10 @@ fi
 backup_dir="/etc/apt/sources.list.d/docker-backup-$(date +%Y%m%d%H%M%S)"
 mkdir -p "${backup_dir}"
 
-shopt -s nullglob
 for source_file in /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker.sources /etc/apt/sources.list.d/download_docker_com_linux_ubuntu.list; do
+  [[ -e "${source_file}" ]] || continue
   mv "${source_file}" "${backup_dir}/"
 done
-shopt -u nullglob
 
 apt update
 apt install -y ca-certificates curl
