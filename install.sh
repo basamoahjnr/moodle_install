@@ -23,6 +23,7 @@ PHP_CLI_BIN="php${PHP_VERSION}"
 PHP_FPM_SOCKET="/run/php/php${PHP_VERSION}-fpm-moodle.sock"
 PHP_FPM_POOL_FILE="/etc/php/${PHP_VERSION}/fpm/pool.d/moodle.conf"
 PHP_INI_FILE="/etc/php/${PHP_VERSION}/fpm/php.ini"
+PHP_CLI_INI_FILE="/etc/php/${PHP_VERSION}/cli/php.ini"
 
 # Ondrej Sury PHP repository (packages.sury.org). Unlike the Launchpad ondrej/php
 # PPA, this DEB repo publishes builds for Ubuntu 26.04 (resolute) that link
@@ -206,6 +207,18 @@ ensure_line() {
     sed -i -E "s|${pattern}|${line}|" "${file}"
   else
     printf '%s\n' "${line}" >> "${file}"
+  fi
+}
+
+set_php_ini_value() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+
+  if grep -Eq "^[;[:space:]]*${key}[[:space:]]*=" "${file}"; then
+    sed -i -E "s|^[;[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" "${file}"
+  else
+    printf '%s = %s\n' "${key}" "${value}" >> "${file}"
   fi
 }
 
@@ -609,7 +622,15 @@ php_admin_value[opcache.max_accelerated_files] = 10000
 php_admin_value[opcache.revalidate_freq] = 60
 PHP_FPM_POOL
 
-  sed -i -E 's/^[;[:space:]]*expose_php[[:space:]]*=.*/expose_php = Off/' "${PHP_INI_FILE}"
+  for ini_file in "${PHP_INI_FILE}" "${PHP_CLI_INI_FILE}"; do
+    set_php_ini_value "${ini_file}" "expose_php" "Off"
+    set_php_ini_value "${ini_file}" "memory_limit" "512M"
+    set_php_ini_value "${ini_file}" "upload_max_filesize" "256M"
+    set_php_ini_value "${ini_file}" "post_max_size" "256M"
+    set_php_ini_value "${ini_file}" "max_execution_time" "300"
+    set_php_ini_value "${ini_file}" "max_input_vars" "5000"
+  done
+
   systemctl restart "php${PHP_VERSION}-fpm"
 }
 
@@ -707,7 +728,9 @@ run_moodle_cli_install() {
     rm -f "${MOODLE_DIR}/config.php"
   fi
 
-  sudo -u www-data "${PHP_CLI_BIN}" "${MOODLE_DIR}/admin/cli/install.php" \
+  (
+    cd "${MOODLE_DIR}"
+    sudo -u www-data "${PHP_CLI_BIN}" "${MOODLE_DIR}/admin/cli/install.php" \
     --wwwroot="https://${MOODLE_HOST}" \
     --dataroot="${MOODLE_DATA_DIR}" \
     --dbtype=pgsql \
@@ -722,6 +745,7 @@ run_moodle_cli_install() {
     --shortname=moodle \
     --agree-license \
     --non-interactive
+  )
 
   write_moodle_config_php
   install -o www-data -g www-data -m 0640 /dev/null "${MOODLE_SENTINEL}"
