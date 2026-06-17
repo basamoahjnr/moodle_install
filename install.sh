@@ -14,7 +14,26 @@ MOODLE_SENTINEL="${MOODLE_DATA_DIR}/.moodle_installed"
 NGINX_SSL_DIR="/etc/nginx/ssl"
 NGINX_CERT_FILE="${NGINX_SSL_DIR}/fullchain.pem"
 NGINX_KEY_FILE="${NGINX_SSL_DIR}/privkey.pem"
-PHP_FPM_POOL_FILE="/etc/php/8.2/fpm/pool.d/moodle.conf"
+# Moodle 5.0 targets Ubuntu 26.04 LTS and its native PHP 8.4 (Moodle 5.0
+# supports PHP 8.2-8.4). Override PHP_VERSION/MOODLE_BRANCH here if your release
+# ships a different default PHP.
+PHP_VERSION="${PHP_VERSION:-8.4}"
+MOODLE_BRANCH="${MOODLE_BRANCH:-MOODLE_500_STABLE}"
+PHP_FPM_SOCKET="/run/php/php${PHP_VERSION}-fpm-moodle.sock"
+PHP_FPM_POOL_FILE="/etc/php/${PHP_VERSION}/fpm/pool.d/moodle.conf"
+PHP_INI_FILE="/etc/php/${PHP_VERSION}/fpm/php.ini"
+
+# ondrej/php PPA (manual setup, used only as a fallback when the distro does not
+# ship the required PHP version). Falls back to the newest codename ondrej builds
+# for when the running release is unsupported.
+ONDREJ_PHP_FALLBACK_CODENAME="noble"
+ONDREJ_PHP_KEY_ID="B8DC7E53946656EFBCE4C1DD71DAEAAB4AD4CAB6"
+ONDREJ_PHP_KEYRING="/usr/share/keyrings/ondrej-php.gpg"
+ONDREJ_PHP_SOURCE_FILE="/etc/apt/sources.list.d/ondrej-php.list"
+
+# PostgreSQL apt repository fallback codename, used when the running release has
+# no -pgdg release published yet.
+PGDG_FALLBACK_CODENAME="noble"
 NGINX_SITE_FILE="/etc/nginx/sites-available/moodle"
 SYSTEMD_SERVICE_FILE="/etc/systemd/system/moodle-cron.service"
 SYSTEMD_TIMER_FILE="/etc/systemd/system/moodle-cron.timer"
@@ -201,6 +220,40 @@ is_supported_ondrej_php_codename() {
   esac
 }
 
+ondrej_php_repo_codename() {
+  # Echo a codename that the ondrej/php PPA actually publishes packages for.
+  local codename="$1"
+  if is_supported_ondrej_php_codename "${codename}"; then
+    printf '%s' "${codename}"
+  else
+    printf '%s' "${ONDREJ_PHP_FALLBACK_CODENAME}"
+  fi
+}
+
+setup_ondrej_php_repo() {
+  # Configure the ondrej/php PPA manually with a signed keyring. add-apt-repository
+  # refuses codenames the PPA has not published for, so we do it by hand and fall
+  # back to the newest supported codename when needed.
+  local codename="$1"
+  local repo_codename
+  repo_codename="$(ondrej_php_repo_codename "${codename}")"
+
+  if [[ "${repo_codename}" != "${codename}" ]]; then
+    warn "Ubuntu ${codename} has no ondrej/php release yet; using ondrej/php packages built for ${repo_codename}. PHP ${PHP_VERSION} is required by this Moodle installer."
+  fi
+
+  if [[ ! -s "${ONDREJ_PHP_KEYRING}" ]]; then
+    log "Importing ondrej/php signing key"
+    curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${ONDREJ_PHP_KEY_ID}" \
+      | gpg --dearmor -o "${ONDREJ_PHP_KEYRING}"
+    chmod 0644 "${ONDREJ_PHP_KEYRING}"
+  fi
+
+  cat > "${ONDREJ_PHP_SOURCE_FILE}" <<EOF_ONDREJ
+deb [signed-by=${ONDREJ_PHP_KEYRING}] https://ppa.launchpadcontent.net/ondrej/php/ubuntu ${repo_codename} main
+EOF_ONDREJ
+}
+
 ubuntu_codename() {
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
@@ -365,46 +418,72 @@ system_prep() {
 }
 
 install_php() {
-  log "Installing PHP 8.2 and Moodle extensions"
+  log "Installing PHP ${PHP_VERSION} and Moodle extensions"
   local codename
   codename="$(ubuntu_codename)"
 
-  if ! is_supported_ondrej_php_codename "${codename}"; then
-    if apt-cache show php8.2-fpm >/dev/null 2>&1; then
-      warn "Ubuntu ${codename} is not supported by the ondrej/php PPA; using available distro PHP 8.2 packages."
-    else
-      die "Ubuntu ${codename} does not currently have a supported ondrej/php PPA release or visible php8.2 packages. This Moodle 4.3 installer targets Ubuntu 24.04 LTS. Use Ubuntu 24.04 LTS for this script, or switch the script to a Moodle/PHP combination supported by Ubuntu ${codename}."
-    fi
-  elif ! grep -Rqs '^deb .*ondrej/php' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
-    add-apt-repository -y ppa:ondrej/php
+  # Prefer packages already visible (distro repo or a previously configured PPA);
+  # otherwise add the ondrej/php PPA, using a fallback codename on releases the
+  # PPA has not published for yet (e.g. Ubuntu 26.04).
+  if apt-cache show "php${PHP_VERSION}-fpm" >/dev/null 2>&1; then
+    log "PHP ${PHP_VERSION} packages already available from configured repositories"
   else
-    log "ondrej/php PPA already configured"
+    setup_ondrej_php_repo "${codename}"
+    apt update
   fi
 
-  apt update
-  if command -v php8.2 >/dev/null 2>&1; then
-    log "PHP 8.2 already installed; ensuring required extensions are present"
+  if ! apt-cache show "php${PHP_VERSION}-fpm" >/dev/null 2>&1; then
+    die "Unable to locate php${PHP_VERSION} packages even after configuring the ondrej/php repository for Ubuntu ${codename}. Check network access to ppa.launchpadcontent.net and that the ondrej/php fallback codename (${ONDREJ_PHP_FALLBACK_CODENAME}) is reachable."
+  fi
+
+  if command -v "php${PHP_VERSION}" >/dev/null 2>&1; then
+    log "PHP ${PHP_VERSION} already installed; ensuring required extensions are present"
   fi
   apt install -y \
-    php8.2-fpm php8.2-pgsql php8.2-xml php8.2-mbstring php8.2-curl \
-    php8.2-zip php8.2-gd php8.2-intl php8.2-soap php8.2-xmlrpc \
-    php8.2-redis php8.2-opcache php8.2-bcmath
+    "php${PHP_VERSION}-fpm" "php${PHP_VERSION}-pgsql" "php${PHP_VERSION}-xml" \
+    "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-curl" "php${PHP_VERSION}-zip" \
+    "php${PHP_VERSION}-gd" "php${PHP_VERSION}-intl" "php${PHP_VERSION}-soap" \
+    "php${PHP_VERSION}-xmlrpc" "php${PHP_VERSION}-redis" "php${PHP_VERSION}-opcache" \
+    "php${PHP_VERSION}-bcmath"
+}
+
+pgdg_repo_codename() {
+  # Echo a codename the PostgreSQL apt repository actually publishes, or nothing
+  # if neither the running release nor the fallback is available.
+  local codename="$1"
+  local candidate
+  for candidate in "${codename}" "${PGDG_FALLBACK_CODENAME}"; do
+    [[ -n "${candidate}" ]] || continue
+    if curl -fsSL --head "https://apt.postgresql.org/pub/repos/apt/dists/${candidate}-pgdg/Release" >/dev/null 2>&1; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
 }
 
 install_postgresql() {
-  log "Installing PostgreSQL from the official PostgreSQL apt repository"
-  install -d -m 0755 /usr/share/postgresql-common/pgdg
-  if [[ ! -f /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc ]]; then
-    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+  local codename repo_codename
+  codename="$(lsb_release -cs)"
+
+  if repo_codename="$(pgdg_repo_codename "${codename}")"; then
+    log "Installing PostgreSQL from the official PostgreSQL apt repository (${repo_codename}-pgdg)"
+    if [[ "${repo_codename}" != "${codename}" ]]; then
+      warn "PostgreSQL apt repository has no ${codename}-pgdg release yet; using ${repo_codename}-pgdg packages."
+    fi
+    install -d -m 0755 /usr/share/postgresql-common/pgdg
+    if [[ ! -f /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc ]]; then
+      curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+    fi
+    cat > /etc/apt/sources.list.d/pgdg.list <<EOF_PGDG
+deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${repo_codename}-pgdg main
+EOF_PGDG
+    apt update
+  else
+    warn "PostgreSQL apt repository is unavailable for ${codename}; using Ubuntu's bundled PostgreSQL packages."
+    rm -f /etc/apt/sources.list.d/pgdg.list
   fi
 
-  local codename
-  codename="$(lsb_release -cs)"
-  cat > /etc/apt/sources.list.d/pgdg.list <<EOF_PGDG
-deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main
-EOF_PGDG
-
-  apt update
   apt install -y postgresql postgresql-contrib
   systemctl enable --now postgresql
 }
@@ -462,7 +541,7 @@ setup_moodle_code() {
   elif [[ -e "${MOODLE_DIR}" ]]; then
     die "${MOODLE_DIR} exists but is not a Moodle git checkout. Move it aside before rerunning."
   else
-    git clone --depth 1 --branch MOODLE_403_STABLE https://github.com/moodle/moodle.git "${MOODLE_DIR}"
+    git clone --depth 1 --branch "${MOODLE_BRANCH}" https://github.com/moodle/moodle.git "${MOODLE_DIR}"
   fi
 
   install -d -m 0770 -o www-data -g www-data "${MOODLE_DATA_DIR}"
@@ -473,12 +552,13 @@ setup_moodle_code() {
 
 write_php_fpm_pool() {
   log "Writing PHP-FPM Moodle pool"
-  cat > "${PHP_FPM_POOL_FILE}" <<'PHP_FPM_POOL'
+  install -d -m 0755 "$(dirname "${PHP_FPM_POOL_FILE}")"
+  cat > "${PHP_FPM_POOL_FILE}" <<PHP_FPM_POOL
 [moodle]
 user = www-data
 group = www-data
 
-listen = /run/php/php8.2-fpm-moodle.sock
+listen = ${PHP_FPM_SOCKET}
 listen.owner = www-data
 listen.group = www-data
 listen.mode = 0660
@@ -501,8 +581,8 @@ php_admin_value[opcache.max_accelerated_files] = 10000
 php_admin_value[opcache.revalidate_freq] = 60
 PHP_FPM_POOL
 
-  sed -i -E 's/^[;[:space:]]*expose_php[[:space:]]*=.*/expose_php = Off/' /etc/php/8.2/fpm/php.ini
-  systemctl restart php8.2-fpm
+  sed -i -E 's/^[;[:space:]]*expose_php[[:space:]]*=.*/expose_php = Off/' "${PHP_INI_FILE}"
+  systemctl restart "php${PHP_VERSION}-fpm"
 }
 
 write_moodle_config_php() {
@@ -707,7 +787,7 @@ server {
         fastcgi_param HTTPS on;
         fastcgi_param HTTP_PROXY "";
         fastcgi_read_timeout 300;
-        fastcgi_pass unix:/run/php/php8.2-fpm-moodle.sock;
+        fastcgi_pass unix:${PHP_FPM_SOCKET};
     }
 }
 NGINX_SITE
@@ -836,7 +916,7 @@ Self-signed certificate note:
 
 Useful logs:
   Nginx:    /var/log/nginx/
-  PHP-FPM:  /var/log/php8.2-fpm.log
+  PHP-FPM:  /var/log/php${PHP_VERSION}-fpm.log
 
 Moodle cron timer:
   systemctl status moodle-cron.timer
