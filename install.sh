@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+LOCAL_ENV_FILE="${SCRIPT_DIR}/.env"
 MOODLE_DIR="/var/www/moodle"
 MOODLE_DATA_DIR="/var/moodledata"
 MOODLE_OPT_DIR="/opt/moodle"
@@ -41,7 +43,7 @@ die() {
 }
 
 if [[ "${EUID}" -ne 0 ]]; then
-  exec sudo -E bash "$0" "$@"
+  exec sudo bash "$0" "$@"
 fi
 
 require_command() {
@@ -188,17 +190,112 @@ ensure_line() {
   fi
 }
 
+is_supported_ondrej_php_codename() {
+  case "$1" in
+    jammy|noble)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ubuntu_codename() {
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    printf '%s' "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+    return
+  fi
+  lsb_release -cs 2>/dev/null || true
+}
+
+disable_unsupported_ondrej_php_ppa() {
+  local codename="$1"
+  local source_file
+  local backup_dir
+
+  is_supported_ondrej_php_codename "${codename}" && return 0
+
+  backup_dir="/etc/apt/sources.list.d/disabled-ondrej-php-$(date +%Y%m%d%H%M%S)"
+  for source_file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [[ -e "${source_file}" ]] || continue
+    if grep -Eiq 'ppa\.launchpadcontent\.net/ondrej/php|ppa:ondrej/php|ondrej.*php' "${source_file}"; then
+      install -d -m 0755 "${backup_dir}"
+      mv "${source_file}" "${backup_dir}/"
+    fi
+  done
+}
+
+load_local_env_if_present() {
+  if [[ ! -f "${LOCAL_ENV_FILE}" ]]; then
+    return
+  fi
+
+  log "Loading settings from ${LOCAL_ENV_FILE}"
+  set -a
+  # shellcheck disable=SC1090
+  source "${LOCAL_ENV_FILE}"
+  set +a
+}
+
+validate_existing_inputs() {
+  local valid=true
+
+  if [[ -n "${MOODLE_HOST}" && "${MOODLE_HOST}" =~ [[:space:]/] ]]; then
+    warn "MOODLE_HOST in ${LOCAL_ENV_FILE} must be a hostname or IP address without spaces or URL paths."
+    MOODLE_HOST=""
+    valid=false
+  fi
+  if [[ -n "${MOODLE_DB}" ]] && ! is_pg_identifier "${MOODLE_DB}"; then
+    warn "MOODLE_DB in ${LOCAL_ENV_FILE} must be a PostgreSQL identifier."
+    MOODLE_DB=""
+    valid=false
+  fi
+  if [[ -n "${MOODLE_DB_USER}" ]] && ! is_pg_identifier "${MOODLE_DB_USER}"; then
+    warn "MOODLE_DB_USER in ${LOCAL_ENV_FILE} must be a PostgreSQL identifier."
+    MOODLE_DB_USER=""
+    valid=false
+  fi
+  if [[ -n "${CERT_VALID_DAYS}" ]] && ! [[ "${CERT_VALID_DAYS}" =~ ^[1-9][0-9]*$ ]]; then
+    warn "CERT_VALID_DAYS in ${LOCAL_ENV_FILE} must be a positive whole number."
+    CERT_VALID_DAYS=""
+    valid=false
+  fi
+  if [[ -n "${MOODLE_ADMIN_EMAIL}" ]] && ! [[ "${MOODLE_ADMIN_EMAIL}" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+    warn "MOODLE_ADMIN_EMAIL in ${LOCAL_ENV_FILE} is not a valid email address."
+    MOODLE_ADMIN_EMAIL=""
+    valid=false
+  fi
+  if [[ -n "${MOODLE_ADMIN_PASS}" ]] && ! password_meets_moodle_policy "${MOODLE_ADMIN_PASS}"; then
+    warn "MOODLE_ADMIN_PASS in ${LOCAL_ENV_FILE} does not satisfy Moodle's default password policy."
+    MOODLE_ADMIN_PASS=""
+    valid=false
+  fi
+
+  [[ "${valid}" == "true" ]]
+}
+
 collect_inputs() {
-  log "Collecting Moodle deployment settings"
-  read_required "MOODLE_HOST" "Server IP or hostname" "The local IP address or hostname clients will use, for example 192.168.1.50 or moodle.local. This is used for Moodle wwwroot and the self-signed certificate." "" "host"
-  read_required "MOODLE_SITE_NAME" "Moodle site name" "The display name shown in the Moodle LMS interface." "My Moodle Site"
-  read_required "MOODLE_ADMIN_USER" "Moodle admin username" "The administrator account name created by Moodle's installer." "admin"
-  read_secret_confirm "MOODLE_ADMIN_PASS" "Moodle admin password" "The initial administrator password. It must satisfy Moodle's default password policy." "true"
-  read_required "MOODLE_ADMIN_EMAIL" "Moodle admin email" "The administrator email address Moodle stores for the initial admin account." "" "email"
-  read_required "MOODLE_DB" "PostgreSQL database name" "The database that will store Moodle data." "moodle" "pg_identifier"
-  read_required "MOODLE_DB_USER" "PostgreSQL username" "The PostgreSQL role Moodle will use to connect to the database." "moodle" "pg_identifier"
-  read_secret_confirm "MOODLE_DB_PASS" "PostgreSQL password" "The password for Moodle's PostgreSQL role."
-  read_required "CERT_VALID_DAYS" "Self-signed certificate validity days" "The number of days the locally generated TLS certificate remains valid." "3650" "positive_integer"
+  load_local_env_if_present
+  validate_existing_inputs || true
+
+  if [[ -n "${MOODLE_HOST}" && -n "${MOODLE_SITE_NAME}" && -n "${MOODLE_ADMIN_USER}" && -n "${MOODLE_ADMIN_PASS}" && -n "${MOODLE_ADMIN_EMAIL}" && -n "${MOODLE_DB}" && -n "${MOODLE_DB_USER}" && -n "${MOODLE_DB_PASS}" && -n "${CERT_VALID_DAYS}" ]]; then
+    log "Using complete Moodle settings from ${LOCAL_ENV_FILE}"
+    return
+  fi
+
+  log "Collecting missing Moodle deployment settings"
+  [[ -n "${MOODLE_HOST}" ]] || read_required "MOODLE_HOST" "Server IP or hostname" "The local IP address or hostname clients will use, for example 192.168.1.50 or moodle.local. This is used for Moodle wwwroot and the self-signed certificate." "" "host"
+  [[ -n "${MOODLE_SITE_NAME}" ]] || read_required "MOODLE_SITE_NAME" "Moodle site name" "The display name shown in the Moodle LMS interface." "My Moodle Site"
+  [[ -n "${MOODLE_ADMIN_USER}" ]] || read_required "MOODLE_ADMIN_USER" "Moodle admin username" "The administrator account name created by Moodle's installer." "admin"
+  [[ -n "${MOODLE_ADMIN_PASS}" ]] || read_secret_confirm "MOODLE_ADMIN_PASS" "Moodle admin password" "The initial administrator password. It must satisfy Moodle's default password policy." "true"
+  [[ -n "${MOODLE_ADMIN_EMAIL}" ]] || read_required "MOODLE_ADMIN_EMAIL" "Moodle admin email" "The administrator email address Moodle stores for the initial admin account." "" "email"
+  [[ -n "${MOODLE_DB}" ]] || read_required "MOODLE_DB" "PostgreSQL database name" "The database that will store Moodle data." "moodle" "pg_identifier"
+  [[ -n "${MOODLE_DB_USER}" ]] || read_required "MOODLE_DB_USER" "PostgreSQL username" "The PostgreSQL role Moodle will use to connect to the database." "moodle" "pg_identifier"
+  [[ -n "${MOODLE_DB_PASS}" ]] || read_secret_confirm "MOODLE_DB_PASS" "PostgreSQL password" "The password for Moodle's PostgreSQL role."
+  [[ -n "${CERT_VALID_DAYS}" ]] || read_required "CERT_VALID_DAYS" "Self-signed certificate validity days" "The number of days the locally generated TLS certificate remains valid." "3650" "positive_integer"
 }
 
 write_env_files() {
@@ -259,6 +356,9 @@ load_env() {
 
 system_prep() {
   log "Preparing Ubuntu packages"
+  local codename
+  codename="$(ubuntu_codename)"
+  disable_unsupported_ondrej_php_ppa "${codename}"
   apt update
   apt upgrade -y
   apt install -y curl git ca-certificates gnupg ufw fail2ban htop unzip openssl wget sudo software-properties-common lsb-release apt-transport-https
@@ -266,7 +366,16 @@ system_prep() {
 
 install_php() {
   log "Installing PHP 8.2 and Moodle extensions"
-  if ! grep -Rqs '^deb .*ondrej/php' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
+  local codename
+  codename="$(ubuntu_codename)"
+
+  if ! is_supported_ondrej_php_codename "${codename}"; then
+    if apt-cache show php8.2-fpm >/dev/null 2>&1; then
+      warn "Ubuntu ${codename} is not supported by the ondrej/php PPA; using available distro PHP 8.2 packages."
+    else
+      die "Ubuntu ${codename} does not currently have a supported ondrej/php PPA release or visible php8.2 packages. This Moodle 4.3 installer targets Ubuntu 24.04 LTS. Use Ubuntu 24.04 LTS for this script, or switch the script to a Moodle/PHP combination supported by Ubuntu ${codename}."
+    fi
+  elif ! grep -Rqs '^deb .*ondrej/php' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
     add-apt-repository -y ppa:ondrej/php
   else
     log "ondrej/php PPA already configured"
