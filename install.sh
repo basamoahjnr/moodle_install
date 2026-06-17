@@ -929,22 +929,36 @@ health_check() {
   local url="https://${MOODLE_HOST}/login/index.php"
   local deadline=$((SECONDS + 600))
   local ok=false
+  local direct_status
+  local local_status
+
+  curl_http_status() {
+    curl -skL --connect-timeout 5 --max-time 20 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null || printf '000'
+  }
+
+  status_is_ready() {
+    [[ "$1" =~ ^[23][0-9][0-9]$ ]]
+  }
 
   while (( SECONDS < deadline )); do
-    if curl -sk --connect-timeout 5 --max-time 20 "${url}" | grep -Eiq '<title>|login'; then
+    direct_status="$(curl_http_status "${url}")"
+    if status_is_ready "${direct_status}"; then
       ok=true
       break
     fi
-    if curl -sk --connect-timeout 5 --max-time 20 --resolve "${MOODLE_HOST}:443:127.0.0.1" "${url}" | grep -Eiq '<title>|login'; then
+
+    local_status="$(curl_http_status --resolve "${MOODLE_HOST}:443:127.0.0.1" "${url}")"
+    if status_is_ready "${local_status}"; then
       ok=true
       break
     fi
-    printf 'Moodle is not ready yet; retrying in 15 seconds...\n'
+
+    printf 'Moodle is not ready yet; direct HTTP status=%s, local Nginx status=%s. Retrying in 15 seconds...\n' "${direct_status}" "${local_status}"
     sleep 15
   done
 
   if [[ "${ok}" != "true" ]]; then
-    warn "Moodle did not respond successfully within 10 minutes. Check Nginx, PHP-FPM, and Moodle logs listed below."
+    warn "Moodle did not return an HTTP 2xx/3xx response within 10 minutes. Run sudo ./diagnose-moodle.sh on the server."
   fi
 }
 
