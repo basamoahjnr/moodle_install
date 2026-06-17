@@ -14,26 +14,26 @@ MOODLE_SENTINEL="${MOODLE_DATA_DIR}/.moodle_installed"
 NGINX_SSL_DIR="/etc/nginx/ssl"
 NGINX_CERT_FILE="${NGINX_SSL_DIR}/fullchain.pem"
 NGINX_KEY_FILE="${NGINX_SSL_DIR}/privkey.pem"
-# Moodle 5.0 targets Ubuntu 26.04 LTS and its native PHP 8.4 (Moodle 5.0
-# supports PHP 8.2-8.4). Override PHP_VERSION/MOODLE_BRANCH here if your release
-# ships a different default PHP.
+# Moodle 5.0 targets PHP 8.4. Ubuntu 26.04's native PHP is 8.5, which Moodle does
+# not yet support, so PHP 8.4 is pinned from Ondrej Sury's repository (below).
+# Override PHP_VERSION/MOODLE_BRANCH here if you target a different combination.
 PHP_VERSION="${PHP_VERSION:-8.4}"
 MOODLE_BRANCH="${MOODLE_BRANCH:-MOODLE_500_STABLE}"
+PHP_CLI_BIN="php${PHP_VERSION}"
 PHP_FPM_SOCKET="/run/php/php${PHP_VERSION}-fpm-moodle.sock"
 PHP_FPM_POOL_FILE="/etc/php/${PHP_VERSION}/fpm/pool.d/moodle.conf"
 PHP_INI_FILE="/etc/php/${PHP_VERSION}/fpm/php.ini"
 
-# ondrej/php PPA (manual setup, used only as a fallback when the distro does not
-# ship the required PHP version). Falls back to the newest codename ondrej builds
-# for when the running release is unsupported.
-ONDREJ_PHP_FALLBACK_CODENAME="noble"
-ONDREJ_PHP_KEY_ID="B8DC7E53946656EFBCE4C1DD71DAEAAB4AD4CAB6"
-ONDREJ_PHP_KEYRING="/usr/share/keyrings/ondrej-php.gpg"
-ONDREJ_PHP_SOURCE_FILE="/etc/apt/sources.list.d/ondrej-php.list"
-
-# PostgreSQL apt repository fallback codename, used when the running release has
-# no -pgdg release published yet.
-PGDG_FALLBACK_CODENAME="noble"
+# Ondrej Sury PHP repository (packages.sury.org). Unlike the Launchpad ondrej/php
+# PPA, this DEB repo publishes builds for Ubuntu 26.04 (resolute) that link
+# against 26.04's libraries.
+SURY_PHP_BASE_URL="https://packages.sury.org/php"
+SURY_PHP_KEY_URL="https://packages.sury.org/php/apt.gpg"
+SURY_PHP_KEYRING="/usr/share/keyrings/deb.sury.org-php.gpg"
+SURY_PHP_SOURCE_FILE="/etc/apt/sources.list.d/sury-php.list"
+# Legacy Launchpad ondrej/php PPA source a previous version of this script may
+# have created; removed on each run because its packages break on 26.04.
+LEGACY_ONDREJ_PHP_SOURCE_FILE="/etc/apt/sources.list.d/ondrej-php.list"
 NGINX_SITE_FILE="/etc/nginx/sites-available/moodle"
 SYSTEMD_SERVICE_FILE="/etc/systemd/system/moodle-cron.service"
 SYSTEMD_TIMER_FILE="/etc/systemd/system/moodle-cron.timer"
@@ -209,51 +209,6 @@ ensure_line() {
   fi
 }
 
-is_supported_ondrej_php_codename() {
-  case "$1" in
-    jammy|noble)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-ondrej_php_repo_codename() {
-  # Echo a codename that the ondrej/php PPA actually publishes packages for.
-  local codename="$1"
-  if is_supported_ondrej_php_codename "${codename}"; then
-    printf '%s' "${codename}"
-  else
-    printf '%s' "${ONDREJ_PHP_FALLBACK_CODENAME}"
-  fi
-}
-
-setup_ondrej_php_repo() {
-  # Configure the ondrej/php PPA manually with a signed keyring. add-apt-repository
-  # refuses codenames the PPA has not published for, so we do it by hand and fall
-  # back to the newest supported codename when needed.
-  local codename="$1"
-  local repo_codename
-  repo_codename="$(ondrej_php_repo_codename "${codename}")"
-
-  if [[ "${repo_codename}" != "${codename}" ]]; then
-    warn "Ubuntu ${codename} has no ondrej/php release yet; using ondrej/php packages built for ${repo_codename}. PHP ${PHP_VERSION} is required by this Moodle installer."
-  fi
-
-  if [[ ! -s "${ONDREJ_PHP_KEYRING}" ]]; then
-    log "Importing ondrej/php signing key"
-    curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${ONDREJ_PHP_KEY_ID}" \
-      | gpg --dearmor -o "${ONDREJ_PHP_KEYRING}"
-    chmod 0644 "${ONDREJ_PHP_KEYRING}"
-  fi
-
-  cat > "${ONDREJ_PHP_SOURCE_FILE}" <<EOF_ONDREJ
-deb [signed-by=${ONDREJ_PHP_KEYRING}] https://ppa.launchpadcontent.net/ondrej/php/ubuntu ${repo_codename} main
-EOF_ONDREJ
-}
-
 ubuntu_codename() {
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
@@ -264,21 +219,31 @@ ubuntu_codename() {
   lsb_release -cs 2>/dev/null || true
 }
 
-disable_unsupported_ondrej_php_ppa() {
+sury_php_has_codename() {
+  curl -fsSL --head "${SURY_PHP_BASE_URL}/dists/$1/Release" >/dev/null 2>&1
+}
+
+setup_sury_php_repo() {
+  # Configure Ondrej Sury's PHP DEB repository for the running release so we can
+  # install PHP ${PHP_VERSION} (Ubuntu 26.04's native PHP is 8.5, unsupported by
+  # Moodle). The repo must publish for this exact codename; older codenames are
+  # not a safe fallback because their packages link against older libraries.
   local codename="$1"
-  local source_file
-  local backup_dir
 
-  is_supported_ondrej_php_codename "${codename}" && return 0
+  if ! sury_php_has_codename "${codename}"; then
+    die "Ondrej Sury's PHP repository has no release for Ubuntu ${codename}. PHP ${PHP_VERSION} (required by ${MOODLE_BRANCH}) is unavailable. Check ${SURY_PHP_BASE_URL}/dists/ for an available codename, or set PHP_VERSION/MOODLE_BRANCH to a supported combination."
+  fi
 
-  backup_dir="/etc/apt/sources.list.d/disabled-ondrej-php-$(date +%Y%m%d%H%M%S)"
-  for source_file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-    [[ -e "${source_file}" ]] || continue
-    if grep -Eiq 'ppa\.launchpadcontent\.net/ondrej/php|ppa:ondrej/php|ondrej.*php' "${source_file}"; then
-      install -d -m 0755 "${backup_dir}"
-      mv "${source_file}" "${backup_dir}/"
-    fi
-  done
+  log "Configuring Ondrej Sury PHP repository for ${codename}"
+  install -d -m 0755 /usr/share/keyrings
+  if [[ ! -s "${SURY_PHP_KEYRING}" ]]; then
+    curl -fsSL "${SURY_PHP_KEY_URL}" -o "${SURY_PHP_KEYRING}"
+    chmod 0644 "${SURY_PHP_KEYRING}"
+  fi
+
+  cat > "${SURY_PHP_SOURCE_FILE}" <<EOF_SURY
+deb [signed-by=${SURY_PHP_KEYRING}] ${SURY_PHP_BASE_URL}/ ${codename} main
+EOF_SURY
 }
 
 load_local_env_if_present() {
@@ -409,12 +374,13 @@ load_env() {
 
 system_prep() {
   log "Preparing Ubuntu packages"
-  local codename
-  codename="$(ubuntu_codename)"
-  disable_unsupported_ondrej_php_ppa "${codename}"
   apt update
   apt upgrade -y
   apt install -y curl git ca-certificates gnupg ufw fail2ban htop unzip openssl wget sudo software-properties-common lsb-release apt-transport-https
+}
+
+php_pkg_available() {
+  apt-cache show "php${PHP_VERSION}-fpm" 2>/dev/null | grep -q '^Package:'
 }
 
 install_php() {
@@ -422,43 +388,45 @@ install_php() {
   local codename
   codename="$(ubuntu_codename)"
 
-  # Prefer packages already visible (distro repo or a previously configured PPA);
-  # otherwise add the ondrej/php PPA, using a fallback codename on releases the
-  # PPA has not published for yet (e.g. Ubuntu 26.04).
-  if apt-cache show "php${PHP_VERSION}-fpm" >/dev/null 2>&1; then
+  # Remove any stale Launchpad ondrej/php PPA source from earlier runs; its
+  # packages are built for older releases and conflict with 26.04 libraries.
+  rm -f "${LEGACY_ONDREJ_PHP_SOURCE_FILE}"
+
+  # The distro ships PHP 8.5 (unsupported by Moodle), so pull PHP ${PHP_VERSION}
+  # from the Sury repo unless a compatible build is already configured.
+  if php_pkg_available; then
     log "PHP ${PHP_VERSION} packages already available from configured repositories"
   else
-    setup_ondrej_php_repo "${codename}"
+    setup_sury_php_repo "${codename}"
     apt update
   fi
 
-  if ! apt-cache show "php${PHP_VERSION}-fpm" >/dev/null 2>&1; then
-    die "Unable to locate php${PHP_VERSION} packages even after configuring the ondrej/php repository for Ubuntu ${codename}. Check network access to ppa.launchpadcontent.net and that the ondrej/php fallback codename (${ONDREJ_PHP_FALLBACK_CODENAME}) is reachable."
+  if ! php_pkg_available; then
+    die "Unable to locate php${PHP_VERSION} packages even after configuring the Sury PHP repository for Ubuntu ${codename}."
   fi
 
-  if command -v "php${PHP_VERSION}" >/dev/null 2>&1; then
-    log "PHP ${PHP_VERSION} already installed; ensuring required extensions are present"
-  fi
+  # Extensions required/recommended by Moodle 5.x. sodium is required; the bundled
+  # core extensions (ctype, dom, json, openssl, simplexml, tokenizer, xmlreader,
+  # ...) ship inside php-cli/php-common/php-xml. xmlrpc is intentionally omitted:
+  # Moodle no longer uses it.
   apt install -y \
-    "php${PHP_VERSION}-fpm" "php${PHP_VERSION}-pgsql" "php${PHP_VERSION}-xml" \
-    "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-curl" "php${PHP_VERSION}-zip" \
-    "php${PHP_VERSION}-gd" "php${PHP_VERSION}-intl" "php${PHP_VERSION}-soap" \
-    "php${PHP_VERSION}-xmlrpc" "php${PHP_VERSION}-redis" "php${PHP_VERSION}-opcache" \
-    "php${PHP_VERSION}-bcmath"
+    "php${PHP_VERSION}-cli" "php${PHP_VERSION}-fpm" "php${PHP_VERSION}-pgsql" \
+    "php${PHP_VERSION}-xml" "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-curl" \
+    "php${PHP_VERSION}-zip" "php${PHP_VERSION}-gd" "php${PHP_VERSION}-intl" \
+    "php${PHP_VERSION}-soap" "php${PHP_VERSION}-sodium" "php${PHP_VERSION}-redis" \
+    "php${PHP_VERSION}-opcache" "php${PHP_VERSION}-bcmath"
 }
 
 pgdg_repo_codename() {
-  # Echo a codename the PostgreSQL apt repository actually publishes, or nothing
-  # if neither the running release nor the fallback is available.
+  # Echo the running release codename if the PostgreSQL apt repository publishes
+  # for it, otherwise nothing. We do not fall back to an older codename: those
+  # packages link against older libraries and break on a newer release like 26.04
+  # (Ubuntu's bundled PostgreSQL is used instead, which Moodle 5.x supports).
   local codename="$1"
-  local candidate
-  for candidate in "${codename}" "${PGDG_FALLBACK_CODENAME}"; do
-    [[ -n "${candidate}" ]] || continue
-    if curl -fsSL --head "https://apt.postgresql.org/pub/repos/apt/dists/${candidate}-pgdg/Release" >/dev/null 2>&1; then
-      printf '%s' "${candidate}"
-      return 0
-    fi
-  done
+  if curl -fsSL --head "https://apt.postgresql.org/pub/repos/apt/dists/${codename}-pgdg/Release" >/dev/null 2>&1; then
+    printf '%s' "${codename}"
+    return 0
+  fi
   return 1
 }
 
@@ -679,7 +647,7 @@ run_moodle_cli_install() {
     rm -f "${MOODLE_DIR}/config.php"
   fi
 
-  sudo -u www-data php "${MOODLE_DIR}/admin/cli/install.php" \
+  sudo -u www-data "${PHP_CLI_BIN}" "${MOODLE_DIR}/admin/cli/install.php" \
     --wwwroot="https://${MOODLE_HOST}" \
     --dataroot="${MOODLE_DATA_DIR}" \
     --dbtype=pgsql \
@@ -816,14 +784,14 @@ configure_firewall() {
 
 write_systemd_cron() {
   log "Writing Moodle cron systemd timer"
-  cat > "${SYSTEMD_SERVICE_FILE}" <<'SYSTEMD_SERVICE'
+  cat > "${SYSTEMD_SERVICE_FILE}" <<SYSTEMD_SERVICE
 [Unit]
 Description=Moodle cron job
 After=network.target postgresql.service redis-server.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/sudo -u www-data /usr/bin/php /var/www/moodle/admin/cli/cron.php
+ExecStart=/usr/bin/sudo -u www-data /usr/bin/${PHP_CLI_BIN} /var/www/moodle/admin/cli/cron.php
 SYSTEMD_SERVICE
 
   cat > "${SYSTEMD_TIMER_FILE}" <<'SYSTEMD_TIMER'
