@@ -246,6 +246,21 @@ deb [signed-by=${SURY_PHP_KEYRING}] ${SURY_PHP_BASE_URL}/ ${codename} main
 EOF_SURY
 }
 
+remove_legacy_ondrej_php_sources() {
+  local source_file
+  local backup_dir
+
+  backup_dir="/etc/apt/sources.list.d/disabled-launchpad-ondrej-php-$(date +%Y%m%d%H%M%S)"
+  for source_file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [[ -e "${source_file}" ]] || continue
+    if grep -Eiq 'ppa\.launchpadcontent\.net/ondrej/php|ppa:ondrej/php|launchpad.*ondrej.*php' "${source_file}"; then
+      install -d -m 0755 "${backup_dir}"
+      mv "${source_file}" "${backup_dir}/"
+      warn "Disabled incompatible Launchpad ondrej/php source: ${source_file}"
+    fi
+  done
+}
+
 load_local_env_if_present() {
   if [[ ! -f "${LOCAL_ENV_FILE}" ]]; then
     return
@@ -374,6 +389,7 @@ load_env() {
 
 system_prep() {
   log "Preparing Ubuntu packages"
+  remove_legacy_ondrej_php_sources
   apt update
   apt upgrade -y
   apt install -y curl git ca-certificates gnupg ufw fail2ban htop unzip openssl wget sudo software-properties-common lsb-release apt-transport-https
@@ -381,6 +397,44 @@ system_prep() {
 
 php_pkg_available() {
   apt-cache show "php${PHP_VERSION}-fpm" 2>/dev/null | grep -q '^Package:'
+}
+
+apt_pkg_available() {
+  apt-cache show "$1" 2>/dev/null | grep -q '^Package:'
+}
+
+php_extension_loaded() {
+  local extension="$1"
+  "${PHP_CLI_BIN}" -m 2>/dev/null | grep -Eiq "^${extension}$"
+}
+
+install_php_redis_extension() {
+  local redis_package="php${PHP_VERSION}-redis"
+
+  if apt_pkg_available "${redis_package}"; then
+    apt install -y "${redis_package}"
+    return
+  fi
+
+  warn "${redis_package} is not available for this repository/release; building redis for PHP ${PHP_VERSION} from PECL."
+  apt install -y "php${PHP_VERSION}-dev" php-pear build-essential pkg-config
+
+  if php_extension_loaded redis; then
+    log "PHP redis extension is already loaded for PHP ${PHP_VERSION}"
+    return
+  fi
+
+  printf '\n\n\n\n\n\n\n\n\n\n' | PHP_PEAR_PHP_BIN="/usr/bin/${PHP_CLI_BIN}" "${PHP_CLI_BIN}" /usr/share/php/peclcmd.php channel-update pecl.php.net
+  printf '\n\n\n\n\n\n\n\n\n\n' | PHP_PEAR_PHP_BIN="/usr/bin/${PHP_CLI_BIN}" "${PHP_CLI_BIN}" /usr/share/php/peclcmd.php install redis
+
+  cat > "/etc/php/${PHP_VERSION}/mods-available/redis.ini" <<'REDIS_INI'
+extension=redis.so
+REDIS_INI
+  phpenmod -v "${PHP_VERSION}" redis
+
+  if ! php_extension_loaded redis; then
+    die "PECL installed redis, but PHP ${PHP_VERSION} is not loading the redis extension."
+  fi
 }
 
 install_php() {
@@ -391,6 +445,7 @@ install_php() {
   # Remove any stale Launchpad ondrej/php PPA source from earlier runs; its
   # packages are built for older releases and conflict with 26.04 libraries.
   rm -f "${LEGACY_ONDREJ_PHP_SOURCE_FILE}"
+  remove_legacy_ondrej_php_sources
 
   # The distro ships PHP 8.5 (unsupported by Moodle), so pull PHP ${PHP_VERSION}
   # from the Sury repo unless a compatible build is already configured.
@@ -405,16 +460,21 @@ install_php() {
     die "Unable to locate php${PHP_VERSION} packages even after configuring the Sury PHP repository for Ubuntu ${codename}."
   fi
 
-  # Extensions required/recommended by Moodle 5.x. sodium is required; the bundled
-  # core extensions (ctype, dom, json, openssl, simplexml, tokenizer, xmlreader,
-  # ...) ship inside php-cli/php-common/php-xml. xmlrpc is intentionally omitted:
-  # Moodle no longer uses it.
+  # Extensions required/recommended by Moodle 5.x. Sodium is bundled with PHP
+  # 7.2+ when built with sodium support; Sury's PHP 8.4 package does not publish
+  # a separate php8.4-sodium package. xmlrpc is intentionally omitted: Moodle no
+  # longer uses it.
   apt install -y \
     "php${PHP_VERSION}-cli" "php${PHP_VERSION}-fpm" "php${PHP_VERSION}-pgsql" \
     "php${PHP_VERSION}-xml" "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-curl" \
     "php${PHP_VERSION}-zip" "php${PHP_VERSION}-gd" "php${PHP_VERSION}-intl" \
-    "php${PHP_VERSION}-soap" "php${PHP_VERSION}-sodium" "php${PHP_VERSION}-redis" \
-    "php${PHP_VERSION}-opcache" "php${PHP_VERSION}-bcmath"
+    "php${PHP_VERSION}-soap" "php${PHP_VERSION}-opcache" "php${PHP_VERSION}-bcmath"
+
+  if ! php_extension_loaded sodium; then
+    die "PHP ${PHP_VERSION} installed, but the sodium extension is not loaded. Moodle requires sodium."
+  fi
+
+  install_php_redis_extension
 }
 
 pgdg_repo_codename() {
