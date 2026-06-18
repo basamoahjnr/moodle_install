@@ -320,6 +320,12 @@ php_pkg_available() {
 
 php_extension_loaded() {
   local extension="$1"
+  # OPcache registers itself as the Zend module "Zend OPcache", so it never
+  # shows up as a plain "opcache" line in `php -m`. Match that name too.
+  if [[ "${extension}" == "opcache" ]]; then
+    "${PHP_CLI_BIN}" -m 2>/dev/null | grep -Eiq "^(opcache|zend opcache)$"
+    return
+  fi
   "${PHP_CLI_BIN}" -m 2>/dev/null | grep -Eiq "^${extension}$"
 }
 
