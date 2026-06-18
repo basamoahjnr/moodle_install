@@ -15,7 +15,6 @@ NGINX_SSL_DIR="/etc/nginx/ssl"
 NGINX_CERT_FILE="${NGINX_SSL_DIR}/fullchain.pem"
 NGINX_KEY_FILE="${NGINX_SSL_DIR}/privkey.pem"
 
-# Moodle 4.5 requires PHP 8.3 – Ubuntu 24.04 ships it natively.
 PHP_VERSION="${PHP_VERSION:-8.3}"
 MOODLE_BRANCH="${MOODLE_BRANCH:-MOODLE_405_STABLE}"
 PHP_CLI_BIN="php${PHP_VERSION}"
@@ -364,7 +363,21 @@ install_php() {
     fi
   done
 
-  # Verification
+  # Force-enable opcache because the package sometimes doesn't enable the module automatically
+  if php_extension_loaded "opcache"; then
+    log "opcache already loaded"
+  else
+    if apt-cache show "php${PHP_VERSION}-opcache" >/dev/null 2>&1; then
+      apt install -y "php${PHP_VERSION}-opcache"
+      phpenmod -v "${PHP_VERSION}" opcache
+      systemctl restart "php${PHP_VERSION}-fpm"
+    fi
+    if ! php_extension_loaded "opcache"; then
+      warn "opcache still not loaded – try restarting PHP-FPM manually"
+    fi
+  fi
+
+  # Verify required extensions
   log "Verifying required extensions for Moodle 4.5"
   local required_ext=(
     curl dom gd intl json mbstring openssl pcre pgsql
@@ -389,6 +402,7 @@ install_php() {
   done
   [[ ${#missing_required[@]} -gt 0 ]] && die "Missing required extensions: ${missing_required[*]}"
 
+  # Verify recommended extensions
   log "Checking recommended extensions"
   local recommended_ext=(
     bcmath fileinfo iconv opcache redis soap xmlrpc
@@ -533,7 +547,6 @@ php_admin_value[opcache.max_accelerated_files] = 20000
 php_admin_value[opcache.revalidate_freq] = 60
 PHP_FPM_POOL
 
-  # Apply some settings also to CLI for consistency
   for ini_file in "${PHP_INI_FILE}" "${PHP_CLI_INI_FILE}"; do
     set_php_ini_value "${ini_file}" "expose_php" "Off"
     set_php_ini_value "${ini_file}" "memory_limit" "1024M"
@@ -647,8 +660,52 @@ run_moodle_cli_install() {
   moodle_db_has_config_table || die "Installation failed – config table missing"
 }
 
+# ---------- Cron timer (fixed service unit) ----------
+write_systemd_cron() {
+  log "Creating Moodle cron timer"
+
+  cat > "${SYSTEMD_SERVICE_FILE}" <<SYSTEMD_SERVICE
+[Unit]
+Description=Moodle cron job
+After=network.target postgresql.service redis-server.service
+
+[Service]
+Type=oneshot
+User=www-data
+Group=www-data
+ExecStart=/usr/bin/${PHP_CLI_BIN} /var/www/moodle/admin/cli/cron.php
+Nice=10
+IOSchedulingClass=idle
+SYSTEMD_SERVICE
+
+  cat > "${SYSTEMD_TIMER_FILE}" <<'SYSTEMD_TIMER'
+[Unit]
+Description=Run Moodle cron every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=moodle-cron.service
+
+[Install]
+WantedBy=timers.target
+SYSTEMD_TIMER
+
+  systemctl daemon-reload
+  systemctl enable --now moodle-cron.timer
+
+  # Verify immediately
+  sleep 2
+  if systemctl is-active --quiet moodle-cron.timer; then
+    log "Moodle cron timer is active"
+  else
+    warn "Moodle cron timer did not start – check 'systemctl status moodle-cron.timer'"
+  fi
+}
+
 # ---------- Comprehensive feature check ----------
-# Reads values directly from the FPM pool to avoid CLI ini mismatches
+# Reads FPM pool values directly (not CLI ini) to avoid mismatches.
 parse_fpm_pool_value() {
   local key="$1"
   grep -E "^\s*php_admin_value\[${key}\]" "${PHP_FPM_POOL_FILE}" | \
@@ -661,7 +718,6 @@ check_moodle_features() {
   local all_ok=true
   local warnings=()
 
-  # 1. PHP version
   log "1. PHP version"
   local php_ver=$("${PHP_CLI_BIN}" -v | head -1 | grep -oP 'PHP \K[0-9]+\.[0-9]+')
   if [[ "${php_ver}" == "8.3" ]]; then
@@ -671,7 +727,6 @@ check_moodle_features() {
     all_ok=false
   fi
 
-  # 2. Required extensions
   log "2. Required PHP extensions"
   local req_ext=( curl dom gd intl json mbstring openssl pcre pgsql SimpleXML sodium tokenizer xml xmlreader zip )
   local missing_req=()
@@ -686,7 +741,6 @@ check_moodle_features() {
   done
   [[ ${#missing_req[@]} -gt 0 ]] && die "Critical: missing required extensions: ${missing_req[*]}"
 
-  # 3. Recommended extensions
   log "3. Recommended extensions"
   local rec_ext=( bcmath fileinfo iconv opcache redis soap xmlrpc )
   for ext in "${rec_ext[@]}"; do
@@ -698,7 +752,6 @@ check_moodle_features() {
     fi
   done
 
-  # 4. PHP-FPM pool values (the ones that matter for Moodle)
   log "4. PHP-FPM pool configuration"
   declare -A expected_pool=(
     [memory_limit]=1024M
@@ -713,7 +766,6 @@ check_moodle_features() {
     local actual
     actual=$(parse_fpm_pool_value "${key}")
     local expect="${expected_pool[$key]}"
-    # numeric comparison if both are integers, else string
     if [[ "${actual}" == "${expect}" ]] || \
        ( [[ "${actual}" =~ ^[0-9]+$ ]] && [[ "${expect}" =~ ^[0-9]+$ ]] && (( actual >= expect )) ); then
       printf '  ✓ %s = %s\n' "${key}" "${actual}"
@@ -723,7 +775,6 @@ check_moodle_features() {
     fi
   done
 
-  # 5. PostgreSQL
   log "5. PostgreSQL"
   local pg_ver; pg_ver=$(sudo -u postgres psql -tAc "SHOW server_version;" | cut -d. -f1)
   if [[ "${pg_ver}" -ge 12 ]]; then
@@ -739,7 +790,6 @@ check_moodle_features() {
     all_ok=false
   fi
 
-  # 6. Services
   log "6. Services"
   local svc_list=(
     "postgresql:PostgreSQL"
@@ -759,7 +809,6 @@ check_moodle_features() {
     fi
   done
 
-  # 7. Disk space
   log "7. Disk space"
   local avail; avail=$(df -BG "${MOODLE_DATA_DIR}" 2>/dev/null | awk 'NR==2{print $4}' | sed 's/G//')
   if [[ -n "${avail}" && "${avail}" -ge 10 ]]; then
@@ -772,7 +821,6 @@ check_moodle_features() {
     all_ok=false
   fi
 
-  # 8. Moodle installation
   log "8. Moodle installation"
   if moodle_is_installed; then
     printf '  ✓ Moodle installed\n'
@@ -781,7 +829,6 @@ check_moodle_features() {
     all_ok=false
   fi
 
-  # 9. Redis ping
   log "9. Redis connectivity"
   if redis-cli ping | grep -q PONG; then
     printf '  ✓ Redis responds\n'
@@ -823,7 +870,7 @@ generate_self_signed_cert() {
   openssl x509 -in "${NGINX_CERT_FILE}" -noout -subject >/dev/null || die "Invalid certificate"
 }
 
-# ---------- Nginx site (client_max_body_size matches upload limit) ----------
+# ---------- Nginx site (http2 fixed) ----------
 write_nginx_site() {
   log "Writing Nginx site"
   rm -f /etc/nginx/sites-enabled/default
@@ -836,9 +883,8 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name ${MOODLE_HOST};
 
     ssl_certificate /etc/nginx/ssl/fullchain.pem;
@@ -898,49 +944,6 @@ configure_firewall() {
   ufw allow 80/tcp comment 'HTTP'
   ufw allow 443/tcp comment 'HTTPS'
   ufw --force enable
-}
-
-# ---------- Cron timer ----------
-write_systemd_cron() {
-  log "Creating Moodle cron timer"
-cat > "${SYSTEMD_SERVICE_FILE}" <<SYSTEMD_SERVICE
-[Unit]
-Description=Moodle cron job
-After=network.target postgresql.service redis-server.service
-
-[Service]
-Type=oneshot
-User=www-data
-Group=www-data
-ExecStart=/usr/bin/${PHP_CLI_BIN} /var/www/moodle/admin/cli/cron.php
-Nice=10
-IOSchedulingClass=idle
-SYSTEMD_SERVICE
-
-  cat > "${SYSTEMD_TIMER_FILE}" <<'SYSTEMD_TIMER'
-[Unit]
-Description=Run Moodle cron every minute
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=1min
-AccuracySec=10s
-Unit=moodle-cron.service
-
-[Install]
-WantedBy=timers.target
-SYSTEMD_TIMER
-
-  systemctl daemon-reload
-  systemctl enable --now moodle-cron.timer
-
-  # Verify it's active
-  sleep 2
-  if systemctl is-active --quiet moodle-cron.timer; then
-    log "Moodle cron timer is active"
-  else
-    warn "Moodle cron timer did not start – check 'systemctl status moodle-cron.timer'"
-  fi
 }
 
 # ---------- Hardening ----------
@@ -1019,7 +1022,7 @@ All features verified – if any warnings appeared above, review them.
 SUMMARY
 }
 
-# ---------- Main ----------
+# ---------- Main (order fixed: cron before feature check) ----------
 main() {
   require_command apt
   collect_inputs
@@ -1034,8 +1037,8 @@ main() {
   setup_moodle_code
   write_php_fpm_pool
   run_moodle_cli_install
-  write_systemd_cron
-  check_moodle_features
+  write_systemd_cron            # cron timer created & started here
+  check_moodle_features         # now it will find the timer active
   generate_self_signed_cert
   write_nginx_site
   configure_firewall
