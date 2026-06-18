@@ -14,27 +14,16 @@ MOODLE_SENTINEL="${MOODLE_DATA_DIR}/.moodle_installed"
 NGINX_SSL_DIR="/etc/nginx/ssl"
 NGINX_CERT_FILE="${NGINX_SSL_DIR}/fullchain.pem"
 NGINX_KEY_FILE="${NGINX_SSL_DIR}/privkey.pem"
-# Moodle 5.0 targets PHP 8.4. Ubuntu 26.04's native PHP is 8.5, which Moodle does
-# not yet support, so PHP 8.4 is pinned from Ondrej Sury's repository (below).
+# Moodle 4.5 targets PHP 8.3. Ubuntu 24.04's native PHP is 8.3, which is compatible.
 # Override PHP_VERSION/MOODLE_BRANCH here if you target a different combination.
-PHP_VERSION="${PHP_VERSION:-8.4}"
-MOODLE_BRANCH="${MOODLE_BRANCH:-MOODLE_500_STABLE}"
+PHP_VERSION="${PHP_VERSION:-8.3}"
+MOODLE_BRANCH="${MOODLE_BRANCH:-MOODLE_405_STABLE}"
 PHP_CLI_BIN="php${PHP_VERSION}"
 PHP_FPM_SOCKET="/run/php/php${PHP_VERSION}-fpm-moodle.sock"
 PHP_FPM_POOL_FILE="/etc/php/${PHP_VERSION}/fpm/pool.d/moodle.conf"
 PHP_INI_FILE="/etc/php/${PHP_VERSION}/fpm/php.ini"
 PHP_CLI_INI_FILE="/etc/php/${PHP_VERSION}/cli/php.ini"
 
-# Ondrej Sury PHP repository (packages.sury.org). Unlike the Launchpad ondrej/php
-# PPA, this DEB repo publishes builds for Ubuntu 26.04 (resolute) that link
-# against 26.04's libraries.
-SURY_PHP_BASE_URL="https://packages.sury.org/php"
-SURY_PHP_KEY_URL="https://packages.sury.org/php/apt.gpg"
-SURY_PHP_KEYRING="/usr/share/keyrings/deb.sury.org-php.gpg"
-SURY_PHP_SOURCE_FILE="/etc/apt/sources.list.d/sury-php.list"
-# Legacy Launchpad ondrej/php PPA source a previous version of this script may
-# have created; removed on each run because its packages break on 26.04.
-LEGACY_ONDREJ_PHP_SOURCE_FILE="/etc/apt/sources.list.d/ondrej-php.list"
 NGINX_SITE_FILE="/etc/nginx/sites-available/moodle"
 SYSTEMD_SERVICE_FILE="/etc/systemd/system/moodle-cron.service"
 SYSTEMD_TIMER_FILE="/etc/systemd/system/moodle-cron.timer"
@@ -222,58 +211,6 @@ set_php_ini_value() {
   fi
 }
 
-ubuntu_codename() {
-  if [[ -r /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    printf '%s' "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
-    return
-  fi
-  lsb_release -cs 2>/dev/null || true
-}
-
-sury_php_has_codename() {
-  curl -fsSL --head "${SURY_PHP_BASE_URL}/dists/$1/Release" >/dev/null 2>&1
-}
-
-setup_sury_php_repo() {
-  # Configure Ondrej Sury's PHP DEB repository for the running release so we can
-  # install PHP ${PHP_VERSION} (Ubuntu 26.04's native PHP is 8.5, unsupported by
-  # Moodle). The repo must publish for this exact codename; older codenames are
-  # not a safe fallback because their packages link against older libraries.
-  local codename="$1"
-
-  if ! sury_php_has_codename "${codename}"; then
-    die "Ondrej Sury's PHP repository has no release for Ubuntu ${codename}. PHP ${PHP_VERSION} (required by ${MOODLE_BRANCH}) is unavailable. Check ${SURY_PHP_BASE_URL}/dists/ for an available codename, or set PHP_VERSION/MOODLE_BRANCH to a supported combination."
-  fi
-
-  log "Configuring Ondrej Sury PHP repository for ${codename}"
-  install -d -m 0755 /usr/share/keyrings
-  if [[ ! -s "${SURY_PHP_KEYRING}" ]]; then
-    curl -fsSL "${SURY_PHP_KEY_URL}" -o "${SURY_PHP_KEYRING}"
-    chmod 0644 "${SURY_PHP_KEYRING}"
-  fi
-
-  cat > "${SURY_PHP_SOURCE_FILE}" <<EOF_SURY
-deb [signed-by=${SURY_PHP_KEYRING}] ${SURY_PHP_BASE_URL}/ ${codename} main
-EOF_SURY
-}
-
-remove_legacy_ondrej_php_sources() {
-  local source_file
-  local backup_dir
-
-  backup_dir="/etc/apt/sources.list.d/disabled-launchpad-ondrej-php-$(date +%Y%m%d%H%M%S)"
-  for source_file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-    [[ -e "${source_file}" ]] || continue
-    if grep -Eiq 'ppa\.launchpadcontent\.net/ondrej/php|ppa:ondrej/php|launchpad.*ondrej.*php' "${source_file}"; then
-      install -d -m 0755 "${backup_dir}"
-      mv "${source_file}" "${backup_dir}/"
-      warn "Disabled incompatible Launchpad ondrej/php source: ${source_file}"
-    fi
-  done
-}
-
 load_local_env_if_present() {
   if [[ ! -f "${LOCAL_ENV_FILE}" ]]; then
     return
@@ -402,7 +339,6 @@ load_env() {
 
 system_prep() {
   log "Preparing Ubuntu packages"
-  remove_legacy_ondrej_php_sources
   apt update
   apt upgrade -y
   apt install -y curl git ca-certificates gnupg ufw fail2ban htop unzip openssl wget sudo software-properties-common lsb-release apt-transport-https
@@ -412,120 +348,147 @@ php_pkg_available() {
   apt-cache show "php${PHP_VERSION}-fpm" 2>/dev/null | grep -q '^Package:'
 }
 
-apt_pkg_available() {
-  apt-cache show "$1" 2>/dev/null | grep -q '^Package:'
-}
-
 php_extension_loaded() {
   local extension="$1"
   "${PHP_CLI_BIN}" -m 2>/dev/null | grep -Eiq "^${extension}$"
 }
 
-install_php_redis_extension() {
-  local redis_package="php${PHP_VERSION}-redis"
-
-  if apt_pkg_available "${redis_package}"; then
-    apt install -y "${redis_package}"
-    return
-  fi
-
-  warn "${redis_package} is not available for this repository/release; building redis for PHP ${PHP_VERSION} from PECL."
-  apt install -y "php${PHP_VERSION}-dev" php-pear build-essential pkg-config
-
-  if php_extension_loaded redis; then
-    log "PHP redis extension is already loaded for PHP ${PHP_VERSION}"
-    return
-  fi
-
-  printf '\n\n\n\n\n\n\n\n\n\n' | PHP_PEAR_PHP_BIN="/usr/bin/${PHP_CLI_BIN}" "${PHP_CLI_BIN}" /usr/share/php/peclcmd.php channel-update pecl.php.net
-  printf '\n\n\n\n\n\n\n\n\n\n' | PHP_PEAR_PHP_BIN="/usr/bin/${PHP_CLI_BIN}" "${PHP_CLI_BIN}" /usr/share/php/peclcmd.php install redis
-
-  cat > "/etc/php/${PHP_VERSION}/mods-available/redis.ini" <<'REDIS_INI'
-extension=redis.so
-REDIS_INI
-  phpenmod -v "${PHP_VERSION}" redis
-
-  if ! php_extension_loaded redis; then
-    die "PECL installed redis, but PHP ${PHP_VERSION} is not loading the redis extension."
-  fi
-}
-
 install_php() {
   log "Installing PHP ${PHP_VERSION} and Moodle extensions"
-  local codename
-  codename="$(ubuntu_codename)"
 
-  # Remove any stale Launchpad ondrej/php PPA source from earlier runs; its
-  # packages are built for older releases and conflict with 26.04 libraries.
-  rm -f "${LEGACY_ONDREJ_PHP_SOURCE_FILE}"
-  remove_legacy_ondrej_php_sources
-
-  # The distro ships PHP 8.5 (unsupported by Moodle), so pull PHP ${PHP_VERSION}
-  # from the Sury repo unless a compatible build is already configured.
-  if php_pkg_available; then
-    log "PHP ${PHP_VERSION} packages already available from configured repositories"
-  else
-    setup_sury_php_repo "${codename}"
-    apt update
-  fi
-
+  # Ubuntu 24.04 ships with PHP 8.3, which is compatible with Moodle 4.5
   if ! php_pkg_available; then
-    die "Unable to locate php${PHP_VERSION} packages even after configuring the Sury PHP repository for Ubuntu ${codename}."
+    die "PHP ${PHP_VERSION} packages are not available. Ubuntu 24.04 should have PHP 8.3 by default."
   fi
 
-  # Extensions required/recommended by Moodle 5.x. Sodium is bundled with PHP
-  # 7.2+ when built with sodium support; Sury's PHP 8.4 package does not publish
-  # a separate php8.4-sodium package. xmlrpc is intentionally omitted: Moodle no
-  # longer uses it.
-  apt install -y \
-    "php${PHP_VERSION}-cli" "php${PHP_VERSION}-fpm" "php${PHP_VERSION}-pgsql" \
-    "php${PHP_VERSION}-xml" "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-curl" \
-    "php${PHP_VERSION}-zip" "php${PHP_VERSION}-gd" "php${PHP_VERSION}-intl" \
-    "php${PHP_VERSION}-soap" "php${PHP_VERSION}-opcache" "php${PHP_VERSION}-bcmath"
+  # Moodle 4.5 required PHP extensions
+  # Reference: https://docs.moodle.org/405/en/PHP
+  local moodle_required_packages=(
+    "php${PHP_VERSION}-cli"
+    "php${PHP_VERSION}-fpm"
+    "php${PHP_VERSION}-curl"
+    "php${PHP_VERSION}-xml"
+    "php${PHP_VERSION}-gd"
+    "php${PHP_VERSION}-intl"
+    "php${PHP_VERSION}-mbstring"
+    "php${PHP_VERSION}-pgsql"
+    "php${PHP_VERSION}-sodium"
+    "php${PHP_VERSION}-zip"
+  )
 
-  if ! php_extension_loaded sodium; then
-    die "PHP ${PHP_VERSION} installed, but the sodium extension is not loaded. Moodle requires sodium."
+  # Moodle 4.5 recommended PHP extensions
+  local moodle_recommended_packages=(
+    "php${PHP_VERSION}-bcmath"
+    "php${PHP_VERSION}-opcache"
+    "php${PHP_VERSION}-redis"
+    "php${PHP_VERSION}-soap"
+    "php${PHP_VERSION}-xmlrpc"
+  )
+
+  log "Installing required PHP extensions for Moodle 4.5..."
+  apt install -y "${moodle_required_packages[@]}"
+
+  log "Installing recommended PHP extensions for Moodle 4.5..."
+  apt install -y "${moodle_recommended_packages[@]}" || {
+    warn "Some recommended packages may not be available in Ubuntu 24.04 repositories"
+    # Install available recommended packages individually
+    for pkg in "${moodle_recommended_packages[@]}"; do
+      if apt-cache show "$pkg" >/dev/null 2>&1; then
+        apt install -y "$pkg" || warn "Failed to install $pkg"
+      else
+        warn "Package $pkg not available in repositories"
+      fi
+    done
+  }
+
+  # Verify all required extensions are loaded
+  log "Verifying Moodle 4.5 required PHP extensions..."
+  local required_extensions=(
+    "curl"
+    "dom"
+    "gd"
+    "intl"
+    "json"
+    "mbstring"
+    "openssl"
+    "pcre"
+    "pgsql"
+    "SimpleXML"
+    "sodium"
+    "tokenizer"
+    "xml"
+    "xmlreader"
+    "zip"
+  )
+
+  local missing_required=()
+  for ext in "${required_extensions[@]}"; do
+    if php_extension_loaded "${ext}"; then
+      printf '  ✓ Required: %s\n' "${ext}"
+    else
+      printf '  ✗ Required MISSING: %s\n' "${ext}"
+      missing_required+=("${ext}")
+    fi
+  done
+
+  if [[ ${#missing_required[@]} -gt 0 ]]; then
+    die "Missing required PHP extensions for Moodle 4.5: ${missing_required[*]}"
   fi
 
-  install_php_redis_extension
+  # Check recommended extensions
+  log "Checking Moodle 4.5 recommended PHP extensions..."
+  local recommended_extensions=(
+    "bcmath"
+    "fileinfo"
+    "iconv"
+    "opcache"
+    "redis"
+    "soap"
+    "xmlrpc"
+  )
+
+  local missing_recommended=()
+  for ext in "${recommended_extensions[@]}"; do
+    if php_extension_loaded "${ext}"; then
+      printf '  ✓ Recommended: %s\n' "${ext}"
+    else
+      printf '  ○ Recommended missing: %s\n' "${ext}"
+      missing_recommended+=("${ext}")
+    fi
+  done
+
+  if [[ ${#missing_recommended[@]} -gt 0 ]]; then
+    warn "Missing recommended PHP extensions: ${missing_recommended[*]}"
+    warn "Moodle will function but some features may be limited"
+  fi
+
+  log "PHP ${PHP_VERSION} with Moodle extensions installed successfully"
 }
 
-pgdg_repo_codename() {
-  # Echo the running release codename if the PostgreSQL apt repository publishes
-  # for it, otherwise nothing. We do not fall back to an older codename: those
-  # packages link against older libraries and break on a newer release like 26.04
-  # (Ubuntu's bundled PostgreSQL is used instead, which Moodle 5.x supports).
-  local codename="$1"
-  if curl -fsSL --head "https://apt.postgresql.org/pub/repos/apt/dists/${codename}-pgdg/Release" >/dev/null 2>&1; then
-    printf '%s' "${codename}"
-    return 0
+postgresql_installed_version() {
+  if command -v psql >/dev/null 2>&1; then
+    psql --version | awk '{print $3}' | cut -d. -f1
   fi
-  return 1
 }
 
 install_postgresql() {
-  local codename repo_codename
-  codename="$(lsb_release -cs)"
-
-  if repo_codename="$(pgdg_repo_codename "${codename}")"; then
-    log "Installing PostgreSQL from the official PostgreSQL apt repository (${repo_codename}-pgdg)"
-    if [[ "${repo_codename}" != "${codename}" ]]; then
-      warn "PostgreSQL apt repository has no ${codename}-pgdg release yet; using ${repo_codename}-pgdg packages."
-    fi
-    install -d -m 0755 /usr/share/postgresql-common/pgdg
-    if [[ ! -f /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc ]]; then
-      curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
-    fi
-    cat > /etc/apt/sources.list.d/pgdg.list <<EOF_PGDG
-deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${repo_codename}-pgdg main
-EOF_PGDG
-    apt update
-  else
-    warn "PostgreSQL apt repository is unavailable for ${codename}; using Ubuntu's bundled PostgreSQL packages."
-    rm -f /etc/apt/sources.list.d/pgdg.list
+  local pg_version
+  pg_version="$(postgresql_installed_version)"
+  
+  if [[ -n "${pg_version}" && "${pg_version}" -ge 12 ]]; then
+    log "PostgreSQL ${pg_version} is already installed and meets Moodle 4.5 requirements (>= 12)"
+    return
   fi
 
+  log "Installing PostgreSQL"
   apt install -y postgresql postgresql-contrib
+  
+  pg_version="$(postgresql_installed_version)"
+  if [[ -z "${pg_version}" || "${pg_version}" -lt 12 ]]; then
+    die "Failed to install PostgreSQL 12 or later. Moodle 4.5 requires PostgreSQL 12+."
+  fi
+  
+  log "PostgreSQL ${pg_version} installed successfully"
   systemctl enable --now postgresql
 }
 
@@ -548,11 +511,22 @@ configure_postgresql() {
   fi
 
   sudo -u postgres psql -v ON_ERROR_STOP=1 -d "${MOODLE_DB}" -c "ALTER DATABASE \"${MOODLE_DB}\" OWNER TO \"${MOODLE_DB_USER}\";"
+  
+  # Verify database connection
+  if ! sudo -u postgres psql -v ON_ERROR_STOP=1 -d "${MOODLE_DB}" -c "SELECT 1;" >/dev/null 2>&1; then
+    die "Failed to connect to PostgreSQL database ${MOODLE_DB}"
+  fi
 }
 
 install_and_configure_redis() {
   log "Installing and configuring Redis"
-  apt install -y redis-server
+  
+  if command -v redis-server >/dev/null 2>&1; then
+    log "Redis is already installed"
+  else
+    apt install -y redis-server
+  fi
+  
   sed -i -E '/^[[:space:]]*maxmemory[[:space:]]+/d' /etc/redis/redis.conf
   sed -i -E '/^[[:space:]]*maxmemory-policy[[:space:]]+/d' /etc/redis/redis.conf
   sed -i -E '/^[[:space:]]*save[[:space:]]+/d' /etc/redis/redis.conf
@@ -567,12 +541,28 @@ save ""
 REDIS_CONF
   systemctl enable --now redis-server
   systemctl restart redis-server
+  
+  # Verify Redis is running and accepting connections
+  if ! redis-cli ping | grep -q PONG; then
+    die "Redis is not responding to ping"
+  fi
 }
 
 install_nginx() {
   log "Installing Nginx"
-  apt install -y nginx
+  
+  if command -v nginx >/dev/null 2>&1; then
+    log "Nginx is already installed"
+  else
+    apt install -y nginx
+  fi
+  
   systemctl enable --now nginx
+  
+  # Verify Nginx is running
+  if ! systemctl is-active --quiet nginx; then
+    die "Nginx failed to start"
+  fi
 }
 
 setup_moodle_code() {
@@ -589,6 +579,13 @@ setup_moodle_code() {
   chown -R www-data:www-data "${MOODLE_DIR}" "${MOODLE_DATA_DIR}"
   chmod 0755 "${MOODLE_DIR}"
   chmod 0770 "${MOODLE_DATA_DIR}"
+  
+  # Verify Moodle version
+  if [[ -f "${MOODLE_DIR}/version.php" ]]; then
+    local moodle_version
+    moodle_version=$(grep '$release' "${MOODLE_DIR}/version.php" | awk -F"'" '{print $2}')
+    log "Moodle version: ${moodle_version}"
+  fi
 }
 
 write_php_fpm_pool() {
@@ -632,6 +629,11 @@ PHP_FPM_POOL
   done
 
   systemctl restart "php${PHP_VERSION}-fpm"
+  
+  # Verify PHP-FPM is running
+  if ! systemctl is-active --quiet "php${PHP_VERSION}-fpm"; then
+    die "PHP-FPM failed to start"
+  fi
 }
 
 write_moodle_config_php() {
@@ -749,6 +751,214 @@ run_moodle_cli_install() {
 
   write_moodle_config_php
   install -o www-data -g www-data -m 0640 /dev/null "${MOODLE_SENTINEL}"
+  
+  # Verify installation
+  if ! moodle_db_has_config_table; then
+    die "Moodle database installation failed - config table not found"
+  fi
+}
+
+check_moodle_features() {
+  log "Running comprehensive Moodle 4.5 feature verification"
+  
+  local all_ok=true
+  local warnings=()
+  
+  # 1. PHP Version Check
+  log "1. PHP Version Check"
+  local php_version
+  php_version=$("${PHP_CLI_BIN}" -v | head -n1 | grep -oP 'PHP \K[0-9]+\.[0-9]+')
+  if [[ "${php_version}" == "8.3" ]]; then
+    printf '  ✓ PHP version %s (required: 8.3)\n' "${php_version}"
+  else
+    printf '  ✗ PHP version %s (required: 8.3)\n' "${php_version}"
+    all_ok=false
+  fi
+  
+  # 2. Required PHP Extensions
+  log "2. Required PHP Extensions for Moodle 4.5"
+  local required_extensions=(
+    "curl"      # External library access
+    "dom"       # XML DOM support
+    "gd"        # Image processing
+    "intl"      # Internationalization
+    "json"      # JSON encoding/decoding
+    "mbstring"  # Multibyte string handling
+    "openssl"   # SSL/TLS support
+    "pcre"      # Regular expressions
+    "pgsql"     # PostgreSQL database
+    "SimpleXML" # Simple XML parsing
+    "sodium"    # Modern cryptography
+    "tokenizer" # PHP tokenizer
+    "xml"       # XML parsing
+    "xmlreader" # XML Reader
+    "zip"       # Zip archive support
+  )
+  
+  local missing_required=()
+  for ext in "${required_extensions[@]}"; do
+    if php_extension_loaded "${ext}"; then
+      printf '  ✓ Required: %s\n' "${ext}"
+    else
+      printf '  ✗ MISSING Required: %s\n' "${ext}"
+      missing_required+=("${ext}")
+      all_ok=false
+    fi
+  done
+  
+  if [[ ${#missing_required[@]} -gt 0 ]]; then
+    die "Critical: Missing required PHP extensions: ${missing_required[*]}"
+  fi
+  
+  # 3. Recommended PHP Extensions
+  log "3. Recommended PHP Extensions for Moodle 4.5"
+  local recommended_extensions=(
+    "bcmath"   # Arbitrary precision mathematics
+    "fileinfo" # File type detection
+    "iconv"    # Character set conversion
+    "opcache"  # PHP opcode cache
+    "redis"    # Redis session caching
+    "soap"     # SOAP web services
+    "xmlrpc"   # XML-RPC web services
+  )
+  
+  local missing_recommended=()
+  for ext in "${recommended_extensions[@]}"; do
+    if php_extension_loaded "${ext}"; then
+      printf '  ✓ Recommended: %s\n' "${ext}"
+    else
+      printf '  ○ Missing Recommended: %s\n' "${ext}"
+      missing_recommended+=("${ext}")
+    fi
+  done
+  
+  if [[ ${#missing_recommended[@]} -gt 0 ]]; then
+    warn "Missing recommended extensions: ${missing_recommended[*]}"
+    warnings+=("Some Moodle features may be limited due to missing recommended extensions")
+  fi
+  
+  # 4. PHP Configuration Checks
+  log "4. PHP Configuration Checks"
+  local config_checks=(
+    "memory_limit:512M"
+    "upload_max_filesize:256M"
+    "post_max_size:256M"
+    "max_execution_time:300"
+    "max_input_vars:5000"
+    "opcache.enable:1"
+    "opcache.memory_consumption:256"
+  )
+  
+  for check in "${config_checks[@]}"; do
+    local key="${check%%:*}"
+    local expected="${check##*:}"
+    local actual
+    actual=$("${PHP_CLI_BIN}" -r "echo ini_get('${key}');" 2>/dev/null)
+    if [[ "${actual}" == "${expected}" || "${actual}" -ge "${expected}" ]]; then
+      printf '  ✓ %s = %s\n' "${key}" "${actual}"
+    else
+      printf '  ✗ %s = %s (expected: %s)\n' "${key}" "${actual}" "${expected}"
+      all_ok=false
+    fi
+  done
+  
+  # 5. Database Check
+  log "5. PostgreSQL Database Check"
+  local pg_version
+  pg_version=$(sudo -u postgres psql -tAc "SHOW server_version;" 2>/dev/null | cut -d. -f1)
+  if [[ "${pg_version}" -ge 12 ]]; then
+    printf '  ✓ PostgreSQL version %s (required: >= 12)\n' "${pg_version}"
+  else
+    printf '  ✗ PostgreSQL version %s (required: >= 12)\n' "${pg_version}"
+    all_ok=false
+  fi
+  
+  if sudo -u postgres psql -d "${MOODLE_DB}" -c "SELECT 1;" >/dev/null 2>&1; then
+    printf '  ✓ Database connection to %s successful\n' "${MOODLE_DB}"
+  else
+    printf '  ✗ Database connection to %s failed\n' "${MOODLE_DB}"
+    all_ok=false
+  fi
+  
+  # 6. Services Status
+  log "6. Service Status Checks"
+  local services=(
+    "postgresql:PostgreSQL"
+    "redis-server:Redis"
+    "nginx:Nginx"
+    "php${PHP_VERSION}-fpm:PHP-FPM"
+    "moodle-cron.timer:Moodle Cron"
+  )
+  
+  for service in "${services[@]}"; do
+    local svc_name="${service%%:*}"
+    local svc_label="${service##*:}"
+    if systemctl is-active --quiet "${svc_name}" 2>/dev/null; then
+      printf '  ✓ %s is running\n' "${svc_label}"
+    else
+      printf '  ✗ %s is NOT running\n' "${svc_label}"
+      all_ok=false
+    fi
+  done
+  
+  # 7. Disk Space Check
+  log "7. Disk Space Check"
+  local available_space
+  available_space=$(df -BG "${MOODLE_DATA_DIR}" 2>/dev/null | awk 'NR==2 {print $4}' | sed 's/G//')
+  if [[ -n "${available_space}" && "${available_space}" -ge 5 ]]; then
+    printf '  ✓ Available disk space: %s GB (minimum: 5 GB)\n' "${available_space}"
+  elif [[ -n "${available_space}" ]]; then
+    printf '  ✗ Low disk space: %s GB (minimum: 5 GB)\n' "${available_space}"
+    warnings+=("Low disk space may affect Moodle performance")
+  else
+    printf '  ○ Unable to check disk space for %s\n' "${MOODLE_DATA_DIR}"
+  fi
+  
+  # 8. Moodle Installation Verification
+  log "8. Moodle Installation Verification"
+  if moodle_is_installed; then
+    printf '  ✓ Moodle installation detected\n'
+    if [[ -f "${MOODLE_DIR}/version.php" ]]; then
+      local moodle_version
+      moodle_version=$(grep '$release' "${MOODLE_DIR}/version.php" | awk -F"'" '{print $2}')
+      printf '  ✓ Moodle version: %s\n' "${moodle_version}"
+    fi
+    if [[ -f "${MOODLE_SENTINEL}" ]]; then
+      printf '  ✓ Installation sentinel file exists\n'
+    fi
+  else
+    printf '  ✗ Moodle installation not detected\n'
+    all_ok=false
+  fi
+  
+  # 9. Redis Connectivity
+  log "9. Redis Connectivity Check"
+  if command -v redis-cli >/dev/null 2>&1; then
+    if redis-cli ping | grep -q PONG; then
+      printf '  ✓ Redis is responding to ping\n'
+    else
+      printf '  ✗ Redis is not responding\n'
+      all_ok=false
+    fi
+  else
+    printf '  ○ redis-cli not found, skipping Redis check\n'
+  fi
+  
+  # Summary
+  echo ""
+  log "Verification Summary"
+  if [[ "${all_ok}" == "true" ]]; then
+    log "✓ All critical checks passed successfully"
+  else
+    die "✗ Some critical checks failed. Please review the output above."
+  fi
+  
+  if [[ ${#warnings[@]} -gt 0 ]]; then
+    warn "Warnings:"
+    for warning in "${warnings[@]}"; do
+      printf '  • %s\n' "${warning}"
+    done
+  fi
 }
 
 generate_self_signed_cert() {
@@ -773,6 +983,11 @@ generate_self_signed_cert() {
 
   chmod 0600 "${NGINX_KEY_FILE}"
   chmod 0644 "${NGINX_CERT_FILE}"
+  
+  # Verify certificate
+  if ! openssl x509 -in "${NGINX_CERT_FILE}" -noout -subject >/dev/null 2>&1; then
+    die "Failed to generate valid TLS certificate"
+  fi
 }
 
 write_nginx_site() {
@@ -966,7 +1181,7 @@ print_success_summary() {
   cat <<SUMMARY
 
 ============================================================
-Moodle provisioning complete
+Moodle 4.5 provisioning complete
 ============================================================
 
 Access URL:
@@ -974,6 +1189,12 @@ Access URL:
 
 Admin username:
   ${MOODLE_ADMIN_USER}
+
+PHP Version:
+  ${PHP_VERSION} (native Ubuntu 24.04)
+
+Moodle Branch:
+  ${MOODLE_BRANCH}
 
 Self-signed certificate note:
   Browsers will show a certificate warning until clients trust the local
@@ -989,6 +1210,10 @@ Moodle cron timer:
 
 Environment file:
   ${MOODLE_ENV_FILE}
+
+To check all Moodle features:
+  The script automatically verified all required PHP extensions,
+  database connectivity, and service status.
 
 ============================================================
 SUMMARY
@@ -1008,6 +1233,7 @@ main() {
   setup_moodle_code
   write_php_fpm_pool
   run_moodle_cli_install
+  check_moodle_features
   generate_self_signed_cert
   write_nginx_site
   configure_firewall
