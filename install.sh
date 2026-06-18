@@ -570,9 +570,9 @@ listen.owner = www-data
 listen.group = www-data
 listen.mode = 0660
 
-# Sized for ~16GB RAM. With memory_limit=1024M a worst-case request can use
-# ~1GB, and typical Moodle requests use ~150-250MB. max_children=40 caps PHP
-# at a few GB under normal load while leaving headroom for PostgreSQL/Redis/OS.
+; Sized for ~16GB RAM. With memory_limit=1024M a worst-case request can use
+; ~1GB, and typical Moodle requests use ~150-250MB. max_children=40 caps PHP
+; at a few GB under normal load while leaving headroom for PostgreSQL/Redis/OS.
 pm = dynamic
 pm.max_children = 40
 pm.start_servers = 8
