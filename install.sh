@@ -527,6 +527,10 @@ install_nginx() {
   log "Installing Nginx"
   apt install -y nginx 2>/dev/null || true
   systemctl enable --now nginx
+  # Remove any previous Moodle site (available + enabled) so a broken leftover
+  # from an earlier run can't fail the pre-check below. The correct site is
+  # (re)created later in write_nginx_site.
+  rm -f "${NGINX_SITE_FILE}" /etc/nginx/sites-enabled/moodle
   # Test before reload
   nginx -t || die "Nginx configuration is broken (before Moodle site added)"
   systemctl reload nginx
