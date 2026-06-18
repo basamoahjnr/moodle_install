@@ -475,14 +475,14 @@ postgresql_installed_version() {
 install_postgresql() {
   local pg_version
   pg_version="$(postgresql_installed_version)"
-  if [[ -n "${pg_version}" && "${pg_version}" -ge 12 ]]; then
-    log "PostgreSQL ${pg_version} already installed (Moodle requires >=12)"
+  if [[ -n "${pg_version}" && "${pg_version}" -ge 13 ]]; then
+    log "PostgreSQL ${pg_version} already installed (Moodle 4.5 requires >=13)"
     return
   fi
   log "Installing PostgreSQL"
   apt install -y postgresql postgresql-contrib
   pg_version="$(postgresql_installed_version)"
-  [[ -z "${pg_version}" || "${pg_version}" -lt 12 ]] && die "PostgreSQL 12+ required"
+  [[ -z "${pg_version}" || "${pg_version}" -lt 13 ]] && die "PostgreSQL 13+ required for Moodle 4.5"
   systemctl enable --now postgresql
 }
 
@@ -544,6 +544,8 @@ setup_moodle_code() {
   fi
 
   install -d -m 0770 -o www-data -g www-data "${MOODLE_DATA_DIR}"
+  # www-data owns the code during setup so the CLI installer can write
+  # config.php; ownership is tightened to root afterwards (see harden_moodle_code).
   chown -R www-data:www-data "${MOODLE_DIR}" "${MOODLE_DATA_DIR}"
   chmod 0755 "${MOODLE_DIR}"
   chmod 0770 "${MOODLE_DATA_DIR}"
@@ -568,11 +570,14 @@ listen.owner = www-data
 listen.group = www-data
 listen.mode = 0660
 
+# Sized for ~16GB RAM. With memory_limit=1024M a worst-case request can use
+# ~1GB, and typical Moodle requests use ~150-250MB. max_children=40 caps PHP
+# at a few GB under normal load while leaving headroom for PostgreSQL/Redis/OS.
 pm = dynamic
-pm.max_children = 100
-pm.start_servers = 20
-pm.min_spare_servers = 10
-pm.max_spare_servers = 30
+pm.max_children = 40
+pm.start_servers = 8
+pm.min_spare_servers = 5
+pm.max_spare_servers = 12
 pm.max_requests = 500
 
 php_admin_value[memory_limit] = 1024M
@@ -699,6 +704,21 @@ run_moodle_cli_install() {
   moodle_db_has_config_table || die "Installation failed – config table missing"
 }
 
+# ---------- Lock down code ownership (post-install) ----------
+# Moodle's security guidance: the web user must not be able to write its own
+# code. After the installer has written config.php, hand the code tree back to
+# root (group www-data, read/execute only). config.php stays group-readable so
+# www-data can still read it; moodledata remains owned/writable by www-data.
+harden_moodle_code() {
+  log "Locking down Moodle code ownership (root:www-data, read-only to web user)"
+  chown -R root:www-data "${MOODLE_DIR}"
+  chmod 0755 "${MOODLE_DIR}"
+  if [[ -f "${MOODLE_DIR}/config.php" ]]; then
+    chown root:www-data "${MOODLE_DIR}/config.php"
+    chmod 0640 "${MOODLE_DIR}/config.php"
+  fi
+}
+
 # ---------- Cron timer (clean service unit) ----------
 write_systemd_cron() {
   log "Creating Moodle cron timer"
@@ -814,10 +834,10 @@ check_moodle_features() {
 
   log "5. PostgreSQL"
   local pg_ver; pg_ver=$(sudo -u postgres psql -tAc "SHOW server_version;" | cut -d. -f1)
-  if [[ "${pg_ver}" -ge 12 ]]; then
+  if [[ "${pg_ver}" -ge 13 ]]; then
     printf '  ✓ PostgreSQL %s\n' "${pg_ver}"
   else
-    printf '  ✗ PostgreSQL %s (need >=12)\n' "${pg_ver}"
+    printf '  ✗ PostgreSQL %s (need >=13)\n' "${pg_ver}"
     all_ok=false
   fi
   if sudo -u postgres psql -d "${MOODLE_DB}" -c "SELECT 1;" >/dev/null 2>&1; then
@@ -922,8 +942,9 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
     server_name ${MOODLE_HOST};
 
     ssl_certificate /etc/nginx/ssl/fullchain.pem;
@@ -1009,7 +1030,8 @@ post_install_hardening() {
 enabled = true
 port = ssh
 filter = sshd
-logpath = %(sshd_log)s
+# Ubuntu 24.04 logs SSH to the journal; the systemd backend reads it directly,
+# so no logpath is set (a logpath here can stop the jail from loading).
 backend = systemd
 maxretry = 5
 findtime = 10m
@@ -1083,6 +1105,7 @@ main() {
   setup_moodle_code
   write_php_fpm_pool
   run_moodle_cli_install
+  harden_moodle_code
   write_systemd_cron
   check_moodle_features
   generate_self_signed_cert
