@@ -14,8 +14,9 @@ MOODLE_SENTINEL="${MOODLE_DATA_DIR}/.moodle_installed"
 NGINX_SSL_DIR="/etc/nginx/ssl"
 NGINX_CERT_FILE="${NGINX_SSL_DIR}/fullchain.pem"
 NGINX_KEY_FILE="${NGINX_SSL_DIR}/privkey.pem"
-# Moodle 4.5 targets PHP 8.3. Ubuntu 24.04's native PHP is 8.3, which is compatible.
-# Override PHP_VERSION/MOODLE_BRANCH here if you target a different combination.
+
+# Moodle 4.5 targets PHP 8.3. Ubuntu 24.04's native PHP is 8.3 – compatible.
+# Override PHP_VERSION/MOODLE_BRANCH here for a different combination.
 PHP_VERSION="${PHP_VERSION:-8.3}"
 MOODLE_BRANCH="${MOODLE_BRANCH:-MOODLE_405_STABLE}"
 PHP_CLI_BIN="php${PHP_VERSION}"
@@ -363,6 +364,8 @@ install_php() {
 
   # Moodle 4.5 required PHP extensions
   # Reference: https://docs.moodle.org/405/en/PHP
+  # Note: sodium, json, openssl, pcre, tokenizer, SPL, dom, xmlreader, SimpleXML
+  # are bundled with PHP 8.3 core and don't need separate packages
   local moodle_required_packages=(
     "php${PHP_VERSION}-cli"
     "php${PHP_VERSION}-fpm"
@@ -372,7 +375,6 @@ install_php() {
     "php${PHP_VERSION}-intl"
     "php${PHP_VERSION}-mbstring"
     "php${PHP_VERSION}-pgsql"
-    "php${PHP_VERSION}-sodium"
     "php${PHP_VERSION}-zip"
   )
 
@@ -389,20 +391,19 @@ install_php() {
   apt install -y "${moodle_required_packages[@]}"
 
   log "Installing recommended PHP extensions for Moodle 4.5..."
-  apt install -y "${moodle_recommended_packages[@]}" || {
-    warn "Some recommended packages may not be available in Ubuntu 24.04 repositories"
-    # Install available recommended packages individually
-    for pkg in "${moodle_recommended_packages[@]}"; do
-      if apt-cache show "$pkg" >/dev/null 2>&1; then
-        apt install -y "$pkg" || warn "Failed to install $pkg"
-      else
-        warn "Package $pkg not available in repositories"
-      fi
-    done
-  }
+  for pkg in "${moodle_recommended_packages[@]}"; do
+    if apt-cache show "$pkg" >/dev/null 2>&1; then
+      log "Installing $pkg..."
+      apt install -y "$pkg" || warn "Failed to install $pkg"
+    else
+      warn "Package $pkg not available in Ubuntu 24.04 repositories (may be built-in or not needed)"
+    fi
+  done
 
   # Verify all required extensions are loaded
   log "Verifying Moodle 4.5 required PHP extensions..."
+  
+  # Required extensions - those that MUST be present
   local required_extensions=(
     "curl"
     "dom"
@@ -420,11 +421,31 @@ install_php() {
     "xmlreader"
     "zip"
   )
+  
+  # Extensions bundled with PHP 8.3 core (no separate package needed)
+  local core_extensions=(
+    "dom"
+    "json" 
+    "openssl"
+    "pcre"
+    "SimpleXML"
+    "sodium"
+    "tokenizer"
+    "xml"
+    "xmlreader"
+  )
 
   local missing_required=()
   for ext in "${required_extensions[@]}"; do
     if php_extension_loaded "${ext}"; then
-      printf '  ✓ Required: %s\n' "${ext}"
+      local status="✓"
+      for core_ext in "${core_extensions[@]}"; do
+        if [[ "${ext}" == "${core_ext}" ]]; then
+          status="✓ (built-in)"
+          break
+        fi
+      done
+      printf '  %s Required: %s\n' "${status}" "${ext}"
     else
       printf '  ✗ Required MISSING: %s\n' "${ext}"
       missing_required+=("${ext}")
@@ -446,11 +467,23 @@ install_php() {
     "soap"
     "xmlrpc"
   )
+  
+  local builtin_recommended=(
+    "fileinfo"
+    "iconv"
+  )
 
   local missing_recommended=()
   for ext in "${recommended_extensions[@]}"; do
     if php_extension_loaded "${ext}"; then
-      printf '  ✓ Recommended: %s\n' "${ext}"
+      local status="✓"
+      for builtin_ext in "${builtin_recommended[@]}"; do
+        if [[ "${ext}" == "${builtin_ext}" ]]; then
+          status="✓ (built-in)"
+          break
+        fi
+      done
+      printf '  %s Recommended: %s\n' "${status}" "${ext}"
     else
       printf '  ○ Recommended missing: %s\n' "${ext}"
       missing_recommended+=("${ext}")
@@ -512,7 +545,6 @@ configure_postgresql() {
 
   sudo -u postgres psql -v ON_ERROR_STOP=1 -d "${MOODLE_DB}" -c "ALTER DATABASE \"${MOODLE_DB}\" OWNER TO \"${MOODLE_DB_USER}\";"
   
-  # Verify database connection
   if ! sudo -u postgres psql -v ON_ERROR_STOP=1 -d "${MOODLE_DB}" -c "SELECT 1;" >/dev/null 2>&1; then
     die "Failed to connect to PostgreSQL database ${MOODLE_DB}"
   fi
@@ -542,7 +574,6 @@ REDIS_CONF
   systemctl enable --now redis-server
   systemctl restart redis-server
   
-  # Verify Redis is running and accepting connections
   if ! redis-cli ping | grep -q PONG; then
     die "Redis is not responding to ping"
   fi
@@ -559,7 +590,6 @@ install_nginx() {
   
   systemctl enable --now nginx
   
-  # Verify Nginx is running
   if ! systemctl is-active --quiet nginx; then
     die "Nginx failed to start"
   fi
@@ -580,7 +610,6 @@ setup_moodle_code() {
   chmod 0755 "${MOODLE_DIR}"
   chmod 0770 "${MOODLE_DATA_DIR}"
   
-  # Verify Moodle version
   if [[ -f "${MOODLE_DIR}/version.php" ]]; then
     local moodle_version
     moodle_version=$(grep '$release' "${MOODLE_DIR}/version.php" | awk -F"'" '{print $2}')
@@ -630,7 +659,6 @@ PHP_FPM_POOL
 
   systemctl restart "php${PHP_VERSION}-fpm"
   
-  # Verify PHP-FPM is running
   if ! systemctl is-active --quiet "php${PHP_VERSION}-fpm"; then
     die "PHP-FPM failed to start"
   fi
@@ -752,7 +780,6 @@ run_moodle_cli_install() {
   write_moodle_config_php
   install -o www-data -g www-data -m 0640 /dev/null "${MOODLE_SENTINEL}"
   
-  # Verify installation
   if ! moodle_db_has_config_table; then
     die "Moodle database installation failed - config table not found"
   fi
@@ -764,7 +791,6 @@ check_moodle_features() {
   local all_ok=true
   local warnings=()
   
-  # 1. PHP Version Check
   log "1. PHP Version Check"
   local php_version
   php_version=$("${PHP_CLI_BIN}" -v | head -n1 | grep -oP 'PHP \K[0-9]+\.[0-9]+')
@@ -775,24 +801,23 @@ check_moodle_features() {
     all_ok=false
   fi
   
-  # 2. Required PHP Extensions
   log "2. Required PHP Extensions for Moodle 4.5"
   local required_extensions=(
-    "curl"      # External library access
-    "dom"       # XML DOM support
-    "gd"        # Image processing
-    "intl"      # Internationalization
-    "json"      # JSON encoding/decoding
-    "mbstring"  # Multibyte string handling
-    "openssl"   # SSL/TLS support
-    "pcre"      # Regular expressions
-    "pgsql"     # PostgreSQL database
-    "SimpleXML" # Simple XML parsing
-    "sodium"    # Modern cryptography
-    "tokenizer" # PHP tokenizer
-    "xml"       # XML parsing
-    "xmlreader" # XML Reader
-    "zip"       # Zip archive support
+    "curl"
+    "dom"
+    "gd"
+    "intl"
+    "json"
+    "mbstring"
+    "openssl"
+    "pcre"
+    "pgsql"
+    "SimpleXML"
+    "sodium"
+    "tokenizer"
+    "xml"
+    "xmlreader"
+    "zip"
   )
   
   local missing_required=()
@@ -810,16 +835,15 @@ check_moodle_features() {
     die "Critical: Missing required PHP extensions: ${missing_required[*]}"
   fi
   
-  # 3. Recommended PHP Extensions
   log "3. Recommended PHP Extensions for Moodle 4.5"
   local recommended_extensions=(
-    "bcmath"   # Arbitrary precision mathematics
-    "fileinfo" # File type detection
-    "iconv"    # Character set conversion
-    "opcache"  # PHP opcode cache
-    "redis"    # Redis session caching
-    "soap"     # SOAP web services
-    "xmlrpc"   # XML-RPC web services
+    "bcmath"
+    "fileinfo"
+    "iconv"
+    "opcache"
+    "redis"
+    "soap"
+    "xmlrpc"
   )
   
   local missing_recommended=()
@@ -837,7 +861,6 @@ check_moodle_features() {
     warnings+=("Some Moodle features may be limited due to missing recommended extensions")
   fi
   
-  # 4. PHP Configuration Checks
   log "4. PHP Configuration Checks"
   local config_checks=(
     "memory_limit:512M"
@@ -862,7 +885,6 @@ check_moodle_features() {
     fi
   done
   
-  # 5. Database Check
   log "5. PostgreSQL Database Check"
   local pg_version
   pg_version=$(sudo -u postgres psql -tAc "SHOW server_version;" 2>/dev/null | cut -d. -f1)
@@ -880,7 +902,6 @@ check_moodle_features() {
     all_ok=false
   fi
   
-  # 6. Services Status
   log "6. Service Status Checks"
   local services=(
     "postgresql:PostgreSQL"
@@ -901,7 +922,6 @@ check_moodle_features() {
     fi
   done
   
-  # 7. Disk Space Check
   log "7. Disk Space Check"
   local available_space
   available_space=$(df -BG "${MOODLE_DATA_DIR}" 2>/dev/null | awk 'NR==2 {print $4}' | sed 's/G//')
@@ -914,7 +934,6 @@ check_moodle_features() {
     printf '  ○ Unable to check disk space for %s\n' "${MOODLE_DATA_DIR}"
   fi
   
-  # 8. Moodle Installation Verification
   log "8. Moodle Installation Verification"
   if moodle_is_installed; then
     printf '  ✓ Moodle installation detected\n'
@@ -931,7 +950,6 @@ check_moodle_features() {
     all_ok=false
   fi
   
-  # 9. Redis Connectivity
   log "9. Redis Connectivity Check"
   if command -v redis-cli >/dev/null 2>&1; then
     if redis-cli ping | grep -q PONG; then
@@ -944,7 +962,6 @@ check_moodle_features() {
     printf '  ○ redis-cli not found, skipping Redis check\n'
   fi
   
-  # Summary
   echo ""
   log "Verification Summary"
   if [[ "${all_ok}" == "true" ]]; then
@@ -984,7 +1001,6 @@ generate_self_signed_cert() {
   chmod 0600 "${NGINX_KEY_FILE}"
   chmod 0644 "${NGINX_CERT_FILE}"
   
-  # Verify certificate
   if ! openssl x509 -in "${NGINX_CERT_FILE}" -noout -subject >/dev/null 2>&1; then
     die "Failed to generate valid TLS certificate"
   fi
@@ -1211,8 +1227,8 @@ Moodle cron timer:
 Environment file:
   ${MOODLE_ENV_FILE}
 
-To check all Moodle features:
-  The script automatically verified all required PHP extensions,
+All features verified:
+  The script has checked all required PHP extensions,
   database connectivity, and service status.
 
 ============================================================
