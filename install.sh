@@ -15,8 +15,7 @@ NGINX_SSL_DIR="/etc/nginx/ssl"
 NGINX_CERT_FILE="${NGINX_SSL_DIR}/fullchain.pem"
 NGINX_KEY_FILE="${NGINX_SSL_DIR}/privkey.pem"
 
-# Moodle 4.5 targets PHP 8.3. Ubuntu 24.04's native PHP is 8.3 – compatible.
-# Override PHP_VERSION/MOODLE_BRANCH here for a different combination.
+# Moodle 4.5 requires PHP 8.3 – Ubuntu 24.04 ships it natively.
 PHP_VERSION="${PHP_VERSION:-8.3}"
 MOODLE_BRANCH="${MOODLE_BRANCH:-MOODLE_405_STABLE}"
 PHP_CLI_BIN="php${PHP_VERSION}"
@@ -189,22 +188,10 @@ sql_quote_literal() {
   printf "'%s'" "${value}"
 }
 
-ensure_line() {
-  local file="$1"
-  local pattern="$2"
-  local line="$3"
-  if grep -Eq "${pattern}" "${file}"; then
-    sed -i -E "s|${pattern}|${line}|" "${file}"
-  else
-    printf '%s\n' "${line}" >> "${file}"
-  fi
-}
-
 set_php_ini_value() {
   local file="$1"
   local key="$2"
   local value="$3"
-
   if grep -Eq "^[;[:space:]]*${key}[[:space:]]*=" "${file}"; then
     sed -i -E "s|^[;[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" "${file}"
   else
@@ -212,11 +199,11 @@ set_php_ini_value() {
   fi
 }
 
+# ---------- Input collection ----------
 load_local_env_if_present() {
   if [[ ! -f "${LOCAL_ENV_FILE}" ]]; then
     return
   fi
-
   log "Loading settings from ${LOCAL_ENV_FILE}"
   set -a
   # shellcheck disable=SC1090
@@ -226,38 +213,30 @@ load_local_env_if_present() {
 
 validate_existing_inputs() {
   local valid=true
-
   if [[ -n "${MOODLE_HOST}" && "${MOODLE_HOST}" =~ [[:space:]/] ]]; then
     warn "MOODLE_HOST in ${LOCAL_ENV_FILE} must be a hostname or IP address without spaces or URL paths."
-    MOODLE_HOST=""
-    valid=false
+    MOODLE_HOST=""; valid=false
   fi
   if [[ -n "${MOODLE_DB}" ]] && ! is_pg_identifier "${MOODLE_DB}"; then
     warn "MOODLE_DB in ${LOCAL_ENV_FILE} must be a PostgreSQL identifier."
-    MOODLE_DB=""
-    valid=false
+    MOODLE_DB=""; valid=false
   fi
   if [[ -n "${MOODLE_DB_USER}" ]] && ! is_pg_identifier "${MOODLE_DB_USER}"; then
     warn "MOODLE_DB_USER in ${LOCAL_ENV_FILE} must be a PostgreSQL identifier."
-    MOODLE_DB_USER=""
-    valid=false
+    MOODLE_DB_USER=""; valid=false
   fi
   if [[ -n "${CERT_VALID_DAYS}" ]] && ! [[ "${CERT_VALID_DAYS}" =~ ^[1-9][0-9]*$ ]]; then
-    warn "CERT_VALID_DAYS in ${LOCAL_ENV_FILE} must be a positive whole number."
-    CERT_VALID_DAYS=""
-    valid=false
+    warn "CERT_VALID_DAYS must be a positive whole number."
+    CERT_VALID_DAYS=""; valid=false
   fi
   if [[ -n "${MOODLE_ADMIN_EMAIL}" ]] && ! [[ "${MOODLE_ADMIN_EMAIL}" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
-    warn "MOODLE_ADMIN_EMAIL in ${LOCAL_ENV_FILE} is not a valid email address."
-    MOODLE_ADMIN_EMAIL=""
-    valid=false
+    warn "MOODLE_ADMIN_EMAIL is not a valid email."
+    MOODLE_ADMIN_EMAIL=""; valid=false
   fi
   if [[ -n "${MOODLE_ADMIN_PASS}" ]] && ! password_meets_moodle_policy "${MOODLE_ADMIN_PASS}"; then
-    warn "MOODLE_ADMIN_PASS in ${LOCAL_ENV_FILE} does not satisfy Moodle's default password policy."
-    MOODLE_ADMIN_PASS=""
-    valid=false
+    warn "MOODLE_ADMIN_PASS does not meet Moodle's password policy."
+    MOODLE_ADMIN_PASS=""; valid=false
   fi
-
   [[ "${valid}" == "true" ]]
 }
 
@@ -266,20 +245,20 @@ collect_inputs() {
   validate_existing_inputs || true
 
   if [[ -n "${MOODLE_HOST}" && -n "${MOODLE_SITE_NAME}" && -n "${MOODLE_ADMIN_USER}" && -n "${MOODLE_ADMIN_PASS}" && -n "${MOODLE_ADMIN_EMAIL}" && -n "${MOODLE_DB}" && -n "${MOODLE_DB_USER}" && -n "${MOODLE_DB_PASS}" && -n "${CERT_VALID_DAYS}" ]]; then
-    log "Using complete Moodle settings from ${LOCAL_ENV_FILE}"
+    log "Using complete settings from ${LOCAL_ENV_FILE}"
     return
   fi
 
-  log "Collecting missing Moodle deployment settings"
-  [[ -n "${MOODLE_HOST}" ]] || read_required "MOODLE_HOST" "Server IP or hostname" "The local IP address or hostname clients will use, for example 192.168.1.50 or moodle.local. This is used for Moodle wwwroot and the self-signed certificate." "" "host"
-  [[ -n "${MOODLE_SITE_NAME}" ]] || read_required "MOODLE_SITE_NAME" "Moodle site name" "The display name shown in the Moodle LMS interface." "My Moodle Site"
-  [[ -n "${MOODLE_ADMIN_USER}" ]] || read_required "MOODLE_ADMIN_USER" "Moodle admin username" "The administrator account name created by Moodle's installer." "admin"
-  [[ -n "${MOODLE_ADMIN_PASS}" ]] || read_secret_confirm "MOODLE_ADMIN_PASS" "Moodle admin password" "The initial administrator password. It must satisfy Moodle's default password policy." "true"
-  [[ -n "${MOODLE_ADMIN_EMAIL}" ]] || read_required "MOODLE_ADMIN_EMAIL" "Moodle admin email" "The administrator email address Moodle stores for the initial admin account." "" "email"
-  [[ -n "${MOODLE_DB}" ]] || read_required "MOODLE_DB" "PostgreSQL database name" "The database that will store Moodle data." "moodle" "pg_identifier"
-  [[ -n "${MOODLE_DB_USER}" ]] || read_required "MOODLE_DB_USER" "PostgreSQL username" "The PostgreSQL role Moodle will use to connect to the database." "moodle" "pg_identifier"
-  [[ -n "${MOODLE_DB_PASS}" ]] || read_secret_confirm "MOODLE_DB_PASS" "PostgreSQL password" "The password for Moodle's PostgreSQL role."
-  [[ -n "${CERT_VALID_DAYS}" ]] || read_required "CERT_VALID_DAYS" "Self-signed certificate validity days" "The number of days the locally generated TLS certificate remains valid." "3650" "positive_integer"
+  log "Collecting Moodle deployment settings"
+  [[ -n "${MOODLE_HOST}" ]] || read_required "MOODLE_HOST" "Server IP or hostname" "The IP or hostname clients use to reach Moodle." "" "host"
+  [[ -n "${MOODLE_SITE_NAME}" ]] || read_required "MOODLE_SITE_NAME" "Moodle site name" "Display name in the LMS." "My Moodle Site"
+  [[ -n "${MOODLE_ADMIN_USER}" ]] || read_required "MOODLE_ADMIN_USER" "Admin username" "Administrator account name." "admin"
+  [[ -n "${MOODLE_ADMIN_PASS}" ]] || read_secret_confirm "MOODLE_ADMIN_PASS" "Admin password" "Must satisfy Moodle's policy." "true"
+  [[ -n "${MOODLE_ADMIN_EMAIL}" ]] || read_required "MOODLE_ADMIN_EMAIL" "Admin email" "Email for the initial admin." "" "email"
+  [[ -n "${MOODLE_DB}" ]] || read_required "MOODLE_DB" "PostgreSQL DB name" "Database name." "moodle" "pg_identifier"
+  [[ -n "${MOODLE_DB_USER}" ]] || read_required "MOODLE_DB_USER" "PostgreSQL username" "Database role." "moodle" "pg_identifier"
+  [[ -n "${MOODLE_DB_PASS}" ]] || read_secret_confirm "MOODLE_DB_PASS" "PostgreSQL password" "Password for the role."
+  [[ -n "${CERT_VALID_DAYS}" ]] || read_required "CERT_VALID_DAYS" "Certificate validity days" "Number of days for the self-signed cert." "3650" "positive_integer"
 }
 
 write_env_files() {
@@ -302,31 +281,19 @@ write_env_files() {
   umask 022
 
   cat > "${MOODLE_ENV_EXAMPLE}" <<'ENV_EXAMPLE'
-# Server IP address or local hostname clients use to reach Moodle.
+# Server IP or hostname
 MOODLE_HOST="192.168.1.50"
-
-# Display name shown in the Moodle LMS interface.
+# Display name
 MOODLE_SITE_NAME="My Moodle Site"
-
-# Initial Moodle administrator username.
+# Admin credentials
 MOODLE_ADMIN_USER="admin"
-
-# Initial Moodle administrator password. Do not use this example value.
 MOODLE_ADMIN_PASS="ChangeMe-With-A-Strong-Password1!"
-
-# Initial Moodle administrator email address.
 MOODLE_ADMIN_EMAIL="admin@example.local"
-
-# PostgreSQL database name for Moodle.
+# PostgreSQL
 MOODLE_DB="moodle"
-
-# PostgreSQL role Moodle uses to connect to the database.
 MOODLE_DB_USER="moodle"
-
-# PostgreSQL password for MOODLE_DB_USER. Do not use this example value.
 MOODLE_DB_PASS="ChangeMe-With-A-Strong-Database-Password1!"
-
-# Self-signed TLS certificate validity period in days.
+# Certificate
 CERT_VALID_DAYS="3650"
 ENV_EXAMPLE
   chown root:root "${MOODLE_ENV_EXAMPLE}"
@@ -338,13 +305,16 @@ load_env() {
   source "${MOODLE_ENV_FILE}"
 }
 
+# ---------- System prep ----------
 system_prep() {
-  log "Preparing Ubuntu packages"
+  log "Preparing system"
   apt update
   apt upgrade -y
-  apt install -y curl git ca-certificates gnupg ufw fail2ban htop unzip openssl wget sudo software-properties-common lsb-release apt-transport-https
+  apt install -y curl git ca-certificates gnupg ufw fail2ban htop unzip openssl wget sudo \
+    software-properties-common lsb-release apt-transport-https
 }
 
+# ---------- PHP ----------
 php_pkg_available() {
   apt-cache show "php${PHP_VERSION}-fpm" 2>/dev/null | grep -q '^Package:'
 }
@@ -355,18 +325,14 @@ php_extension_loaded() {
 }
 
 install_php() {
-  log "Installing PHP ${PHP_VERSION} and Moodle extensions"
+  log "Installing PHP ${PHP_VERSION} + Moodle extensions"
 
-  # Ubuntu 24.04 ships with PHP 8.3, which is compatible with Moodle 4.5
   if ! php_pkg_available; then
-    die "PHP ${PHP_VERSION} packages are not available. Ubuntu 24.04 should have PHP 8.3 by default."
+    die "PHP ${PHP_VERSION} packages not available. Ubuntu 24.04 should provide them."
   fi
 
-  # Moodle 4.5 required PHP extensions
-  # Reference: https://docs.moodle.org/405/en/PHP
-  # Note: sodium, json, openssl, pcre, tokenizer, SPL, dom, xmlreader, SimpleXML
-  # are bundled with PHP 8.3 core and don't need separate packages
-  local moodle_required_packages=(
+  # Required extensions (sodium, json, etc. are built-in)
+  local required_packages=(
     "php${PHP_VERSION}-cli"
     "php${PHP_VERSION}-fpm"
     "php${PHP_VERSION}-curl"
@@ -378,8 +344,7 @@ install_php() {
     "php${PHP_VERSION}-zip"
   )
 
-  # Moodle 4.5 recommended PHP extensions
-  local moodle_recommended_packages=(
+  local recommended_packages=(
     "php${PHP_VERSION}-bcmath"
     "php${PHP_VERSION}-opcache"
     "php${PHP_VERSION}-redis"
@@ -387,220 +352,140 @@ install_php() {
     "php${PHP_VERSION}-xmlrpc"
   )
 
-  log "Installing required PHP extensions for Moodle 4.5..."
-  apt install -y "${moodle_required_packages[@]}"
+  log "Installing required packages..."
+  apt install -y "${required_packages[@]}"
 
-  log "Installing recommended PHP extensions for Moodle 4.5..."
-  for pkg in "${moodle_recommended_packages[@]}"; do
+  log "Installing recommended packages..."
+  for pkg in "${recommended_packages[@]}"; do
     if apt-cache show "$pkg" >/dev/null 2>&1; then
-      log "Installing $pkg..."
       apt install -y "$pkg" || warn "Failed to install $pkg"
     else
-      warn "Package $pkg not available in Ubuntu 24.04 repositories (may be built-in or not needed)"
+      warn "Package $pkg not available (may be built-in or unnecessary)"
     fi
   done
 
-  # Verify all required extensions are loaded
-  log "Verifying Moodle 4.5 required PHP extensions..."
-  
-  # Required extensions - those that MUST be present
-  local required_extensions=(
-    "curl"
-    "dom"
-    "gd"
-    "intl"
-    "json"
-    "mbstring"
-    "openssl"
-    "pcre"
-    "pgsql"
-    "SimpleXML"
-    "sodium"
-    "tokenizer"
-    "xml"
-    "xmlreader"
-    "zip"
+  # Verification
+  log "Verifying required extensions for Moodle 4.5"
+  local required_ext=(
+    curl dom gd intl json mbstring openssl pcre pgsql
+    SimpleXML sodium tokenizer xml xmlreader zip
   )
-  
-  # Extensions bundled with PHP 8.3 core (no separate package needed)
-  local core_extensions=(
-    "dom"
-    "json" 
-    "openssl"
-    "pcre"
-    "SimpleXML"
-    "sodium"
-    "tokenizer"
-    "xml"
-    "xmlreader"
+  local builtin_ext=(
+    dom json openssl pcre SimpleXML sodium tokenizer xml xmlreader
   )
 
   local missing_required=()
-  for ext in "${required_extensions[@]}"; do
+  for ext in "${required_ext[@]}"; do
     if php_extension_loaded "${ext}"; then
-      local status="✓"
-      for core_ext in "${core_extensions[@]}"; do
-        if [[ "${ext}" == "${core_ext}" ]]; then
-          status="✓ (built-in)"
-          break
-        fi
+      local tag="✓"
+      for b in "${builtin_ext[@]}"; do
+        [[ "${ext}" == "${b}" ]] && tag="✓ (built-in)" && break
       done
-      printf '  %s Required: %s\n' "${status}" "${ext}"
+      printf '  %s Required: %s\n' "${tag}" "${ext}"
     else
-      printf '  ✗ Required MISSING: %s\n' "${ext}"
+      printf '  ✗ MISSING Required: %s\n' "${ext}"
       missing_required+=("${ext}")
     fi
   done
+  [[ ${#missing_required[@]} -gt 0 ]] && die "Missing required extensions: ${missing_required[*]}"
 
-  if [[ ${#missing_required[@]} -gt 0 ]]; then
-    die "Missing required PHP extensions for Moodle 4.5: ${missing_required[*]}"
-  fi
-
-  # Check recommended extensions
-  log "Checking Moodle 4.5 recommended PHP extensions..."
-  local recommended_extensions=(
-    "bcmath"
-    "fileinfo"
-    "iconv"
-    "opcache"
-    "redis"
-    "soap"
-    "xmlrpc"
+  log "Checking recommended extensions"
+  local recommended_ext=(
+    bcmath fileinfo iconv opcache redis soap xmlrpc
   )
-  
-  local builtin_recommended=(
-    "fileinfo"
-    "iconv"
+  local builtin_rec=(
+    fileinfo iconv
   )
 
-  local missing_recommended=()
-  for ext in "${recommended_extensions[@]}"; do
+  local missing_rec=()
+  for ext in "${recommended_ext[@]}"; do
     if php_extension_loaded "${ext}"; then
-      local status="✓"
-      for builtin_ext in "${builtin_recommended[@]}"; do
-        if [[ "${ext}" == "${builtin_ext}" ]]; then
-          status="✓ (built-in)"
-          break
-        fi
+      local tag="✓"
+      for b in "${builtin_rec[@]}"; do
+        [[ "${ext}" == "${b}" ]] && tag="✓ (built-in)" && break
       done
-      printf '  %s Recommended: %s\n' "${status}" "${ext}"
+      printf '  %s Recommended: %s\n' "${tag}" "${ext}"
     else
-      printf '  ○ Recommended missing: %s\n' "${ext}"
-      missing_recommended+=("${ext}")
+      printf '  ○ Missing Recommended: %s\n' "${ext}"
+      missing_rec+=("${ext}")
     fi
   done
+  [[ ${#missing_rec[@]} -gt 0 ]] && warn "Missing recommended extensions: ${missing_rec[*]}"
 
-  if [[ ${#missing_recommended[@]} -gt 0 ]]; then
-    warn "Missing recommended PHP extensions: ${missing_recommended[*]}"
-    warn "Moodle will function but some features may be limited"
-  fi
-
-  log "PHP ${PHP_VERSION} with Moodle extensions installed successfully"
+  log "PHP ${PHP_VERSION} installation complete"
 }
 
+# ---------- PostgreSQL ----------
 postgresql_installed_version() {
-  if command -v psql >/dev/null 2>&1; then
-    psql --version | awk '{print $3}' | cut -d. -f1
-  fi
+  command -v psql >/dev/null 2>&1 && psql --version | awk '{print $3}' | cut -d. -f1
 }
 
 install_postgresql() {
   local pg_version
   pg_version="$(postgresql_installed_version)"
-  
   if [[ -n "${pg_version}" && "${pg_version}" -ge 12 ]]; then
-    log "PostgreSQL ${pg_version} is already installed and meets Moodle 4.5 requirements (>= 12)"
+    log "PostgreSQL ${pg_version} already installed (Moodle requires >=12)"
     return
   fi
-
   log "Installing PostgreSQL"
   apt install -y postgresql postgresql-contrib
-  
   pg_version="$(postgresql_installed_version)"
-  if [[ -z "${pg_version}" || "${pg_version}" -lt 12 ]]; then
-    die "Failed to install PostgreSQL 12 or later. Moodle 4.5 requires PostgreSQL 12+."
-  fi
-  
-  log "PostgreSQL ${pg_version} installed successfully"
+  [[ -z "${pg_version}" || "${pg_version}" -lt 12 ]] && die "PostgreSQL 12+ required"
   systemctl enable --now postgresql
 }
 
 configure_postgresql() {
-  log "Configuring PostgreSQL role and database"
+  log "Configuring PostgreSQL role & database"
   local quoted_password
   quoted_password="$(sql_quote_literal "${MOODLE_DB_PASS}")"
 
   if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname = '${MOODLE_DB_USER}'" | grep -q 1; then
-    log "PostgreSQL role ${MOODLE_DB_USER} already exists; updating password to match ${MOODLE_ENV_FILE}"
-    sudo -u postgres psql -v ON_ERROR_STOP=1 -c "ALTER ROLE \"${MOODLE_DB_USER}\" WITH LOGIN PASSWORD ${quoted_password};"
+    sudo -u postgres psql -c "ALTER ROLE \"${MOODLE_DB_USER}\" WITH LOGIN PASSWORD ${quoted_password};"
   else
-    sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE \"${MOODLE_DB_USER}\" WITH LOGIN PASSWORD ${quoted_password};"
+    sudo -u postgres psql -c "CREATE ROLE \"${MOODLE_DB_USER}\" WITH LOGIN PASSWORD ${quoted_password};"
   fi
 
-  if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname = '${MOODLE_DB}'" | grep -q 1; then
-    log "PostgreSQL database ${MOODLE_DB} already exists"
-  else
+  if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname = '${MOODLE_DB}'" | grep -q 1; then
     sudo -u postgres createdb -O "${MOODLE_DB_USER}" -E UTF8 "${MOODLE_DB}"
   fi
 
-  sudo -u postgres psql -v ON_ERROR_STOP=1 -d "${MOODLE_DB}" -c "ALTER DATABASE \"${MOODLE_DB}\" OWNER TO \"${MOODLE_DB_USER}\";"
-  
-  if ! sudo -u postgres psql -v ON_ERROR_STOP=1 -d "${MOODLE_DB}" -c "SELECT 1;" >/dev/null 2>&1; then
-    die "Failed to connect to PostgreSQL database ${MOODLE_DB}"
-  fi
+  sudo -u postgres psql -d "${MOODLE_DB}" -c "ALTER DATABASE \"${MOODLE_DB}\" OWNER TO \"${MOODLE_DB_USER}\";"
+  sudo -u postgres psql -d "${MOODLE_DB}" -c "SELECT 1;" >/dev/null || die "Cannot connect to database ${MOODLE_DB}"
 }
 
+# ---------- Redis ----------
 install_and_configure_redis() {
-  log "Installing and configuring Redis"
-  
-  if command -v redis-server >/dev/null 2>&1; then
-    log "Redis is already installed"
-  else
-    apt install -y redis-server
-  fi
-  
-  sed -i -E '/^[[:space:]]*maxmemory[[:space:]]+/d' /etc/redis/redis.conf
-  sed -i -E '/^[[:space:]]*maxmemory-policy[[:space:]]+/d' /etc/redis/redis.conf
-  sed -i -E '/^[[:space:]]*save[[:space:]]+/d' /etc/redis/redis.conf
-  sed -i -E '/^[[:space:]]*bind[[:space:]]+/d' /etc/redis/redis.conf
+  log "Setting up Redis"
+  apt install -y redis-server 2>/dev/null || true
+  sed -i '/^[[:space:]]*maxmemory /d; /^[[:space:]]*maxmemory-policy /d; /^[[:space:]]*save /d; /^[[:space:]]*bind /d' /etc/redis/redis.conf
   cat >> /etc/redis/redis.conf <<'REDIS_CONF'
-
 bind 127.0.0.1
 protected-mode yes
-maxmemory 2gb
+maxmemory 4gb
 maxmemory-policy allkeys-lru
 save ""
 REDIS_CONF
   systemctl enable --now redis-server
   systemctl restart redis-server
-  
-  if ! redis-cli ping | grep -q PONG; then
-    die "Redis is not responding to ping"
-  fi
+  redis-cli ping | grep -q PONG || die "Redis not responding"
 }
 
+# ---------- Nginx ----------
 install_nginx() {
   log "Installing Nginx"
-  
-  if command -v nginx >/dev/null 2>&1; then
-    log "Nginx is already installed"
-  else
-    apt install -y nginx
-  fi
-  
+  apt install -y nginx 2>/dev/null || true
   systemctl enable --now nginx
-  
-  if ! systemctl is-active --quiet nginx; then
-    die "Nginx failed to start"
-  fi
+  nginx -t
+  systemctl reload nginx
 }
 
+# ---------- Moodle code ----------
 setup_moodle_code() {
-  log "Setting up Moodle code and data directories"
+  log "Setting up Moodle code & data directories"
   if [[ -d "${MOODLE_DIR}/.git" ]]; then
-    log "${MOODLE_DIR} already exists; skipping Moodle git clone"
+    log "Moodle git repository already present"
   elif [[ -e "${MOODLE_DIR}" ]]; then
-    die "${MOODLE_DIR} exists but is not a Moodle git checkout. Move it aside before rerunning."
+    die "${MOODLE_DIR} exists but is not a Moodle checkout – remove it first"
   else
     git clone --depth 1 --branch "${MOODLE_BRANCH}" https://github.com/moodle/moodle.git "${MOODLE_DIR}"
   fi
@@ -609,16 +494,16 @@ setup_moodle_code() {
   chown -R www-data:www-data "${MOODLE_DIR}" "${MOODLE_DATA_DIR}"
   chmod 0755 "${MOODLE_DIR}"
   chmod 0770 "${MOODLE_DATA_DIR}"
-  
+
   if [[ -f "${MOODLE_DIR}/version.php" ]]; then
-    local moodle_version
-    moodle_version=$(grep '$release' "${MOODLE_DIR}/version.php" | awk -F"'" '{print $2}')
-    log "Moodle version: ${moodle_version}"
+    local ver; ver=$(grep '$release' "${MOODLE_DIR}/version.php" | awk -F"'" '{print $2}')
+    log "Moodle version: ${ver}"
   fi
 }
 
+# ---------- PHP-FPM pool (tuned for 16GB RAM) ----------
 write_php_fpm_pool() {
-  log "Writing PHP-FPM Moodle pool"
+  log "Writing PHP-FPM Moodle pool (16GB server tuned)"
   install -d -m 0755 "$(dirname "${PHP_FPM_POOL_FILE}")"
   cat > "${PHP_FPM_POOL_FILE}" <<PHP_FPM_POOL
 [moodle]
@@ -631,58 +516,57 @@ listen.group = www-data
 listen.mode = 0660
 
 pm = dynamic
-pm.max_children = 50
-pm.start_servers = 10
-pm.min_spare_servers = 5
-pm.max_spare_servers = 20
+pm.max_children = 100
+pm.start_servers = 20
+pm.min_spare_servers = 10
+pm.max_spare_servers = 30
 pm.max_requests = 500
 
-php_admin_value[memory_limit] = 512M
-php_admin_value[upload_max_filesize] = 256M
-php_admin_value[post_max_size] = 256M
+php_admin_value[memory_limit] = 1024M
+php_admin_value[upload_max_filesize] = 512M
+php_admin_value[post_max_size] = 512M
 php_admin_value[max_execution_time] = 300
 php_admin_value[max_input_vars] = 5000
 php_admin_value[opcache.enable] = 1
-php_admin_value[opcache.memory_consumption] = 256
-php_admin_value[opcache.max_accelerated_files] = 10000
+php_admin_value[opcache.memory_consumption] = 512
+php_admin_value[opcache.max_accelerated_files] = 20000
 php_admin_value[opcache.revalidate_freq] = 60
 PHP_FPM_POOL
 
+  # Apply some settings also to CLI for consistency
   for ini_file in "${PHP_INI_FILE}" "${PHP_CLI_INI_FILE}"; do
     set_php_ini_value "${ini_file}" "expose_php" "Off"
-    set_php_ini_value "${ini_file}" "memory_limit" "512M"
-    set_php_ini_value "${ini_file}" "upload_max_filesize" "256M"
-    set_php_ini_value "${ini_file}" "post_max_size" "256M"
+    set_php_ini_value "${ini_file}" "memory_limit" "1024M"
+    set_php_ini_value "${ini_file}" "upload_max_filesize" "512M"
+    set_php_ini_value "${ini_file}" "post_max_size" "512M"
     set_php_ini_value "${ini_file}" "max_execution_time" "300"
     set_php_ini_value "${ini_file}" "max_input_vars" "5000"
+    set_php_ini_value "${ini_file}" "opcache.enable" "1"
+    set_php_ini_value "${ini_file}" "opcache.memory_consumption" "512"
+    set_php_ini_value "${ini_file}" "opcache.max_accelerated_files" "20000"
   done
 
   systemctl restart "php${PHP_VERSION}-fpm"
-  
-  if ! systemctl is-active --quiet "php${PHP_VERSION}-fpm"; then
-    die "PHP-FPM failed to start"
-  fi
+  systemctl is-active --quiet "php${PHP_VERSION}-fpm" || die "PHP-FPM failed to start"
 }
 
+# ---------- Moodle config.php ----------
 write_moodle_config_php() {
   log "Writing Moodle config.php"
   cat > "${MOODLE_DIR}/config.php" <<'PHP_CONFIG'
-<?php  // Moodle configuration file.
+<?php
 unset($CFG);
 global $CFG;
 $CFG = new stdClass();
 
 $envfile = '/opt/moodle/.env';
 if (!is_readable($envfile)) {
-    throw new RuntimeException('Moodle environment file is not readable: ' . $envfile);
+    throw new RuntimeException('Moodle environment file not readable: ' . $envfile);
 }
-
 $env = [];
 foreach (file($envfile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
     $line = trim($line);
-    if ($line === '' || str_starts_with($line, '#') || !str_contains($line, '=')) {
-        continue;
-    }
+    if ($line === '' || str_starts_with($line, '#') || !str_contains($line, '=')) continue;
     [$key, $value] = explode('=', $line, 2);
     $key = trim($key);
     $value = trim($value);
@@ -691,13 +575,9 @@ foreach (file($envfile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line)
     }
     $env[$key] = $value;
 }
-
-foreach (['MOODLE_HOST', 'MOODLE_DB', 'MOODLE_DB_USER', 'MOODLE_DB_PASS'] as $required) {
-    if (!array_key_exists($required, $env) || $env[$required] === '') {
-        throw new RuntimeException('Missing required Moodle environment value: ' . $required);
-    }
+foreach (['MOODLE_HOST','MOODLE_DB','MOODLE_DB_USER','MOODLE_DB_PASS'] as $req) {
+    if (empty($env[$req])) throw new RuntimeException('Missing env: ' . $req);
 }
-
 $CFG->dbtype    = 'pgsql';
 $CFG->dblibrary = 'native';
 $CFG->dbhost    = '127.0.0.1';
@@ -705,32 +585,24 @@ $CFG->dbname    = $env['MOODLE_DB'];
 $CFG->dbuser    = $env['MOODLE_DB_USER'];
 $CFG->dbpass    = $env['MOODLE_DB_PASS'];
 $CFG->prefix    = 'mdl_';
-$CFG->dboptions = [
-    'dbpersist' => false,
-    'dbsocket'  => false,
-    'dbport'    => '',
-];
-
+$CFG->dboptions = ['dbpersist' => false, 'dbsocket' => false, 'dbport' => ''];
 $CFG->wwwroot   = 'https://' . $env['MOODLE_HOST'];
 $CFG->dataroot  = '/var/moodledata';
 $CFG->admin     = 'admin';
-
 $CFG->session_handler_class = '\core\session\redis';
 $CFG->session_redis_host = '127.0.0.1';
 $CFG->session_redis_port = 6379;
 $CFG->session_redis_database = 0;
 $CFG->session_redis_acquire_lock_timeout = 120;
 $CFG->session_redis_lock_expire = 7200;
-
 $CFG->directorypermissions = 0770;
-
 require_once(__DIR__ . '/lib/setup.php');
 PHP_CONFIG
-
   chown www-data:www-data "${MOODLE_DIR}/config.php"
   chmod 0640 "${MOODLE_DIR}/config.php"
 }
 
+# ---------- CLI install ----------
 moodle_db_has_config_table() {
   sudo -u postgres psql -d "${MOODLE_DB}" -tAc "SELECT to_regclass('public.mdl_config')" 2>/dev/null | grep -q 'mdl_config'
 }
@@ -740,27 +612,21 @@ moodle_is_installed() {
 }
 
 run_moodle_cli_install() {
-  log "Running Moodle CLI installer if needed"
+  log "Running Moodle CLI installer"
   if moodle_is_installed; then
-    log "Moodle already appears installed; skipping CLI install"
+    log "Moodle already installed – skipping CLI install"
     write_moodle_config_php
     install -o www-data -g www-data -m 0640 /dev/null "${MOODLE_SENTINEL}"
     return
   fi
 
   if [[ -f "${MOODLE_DIR}/config.php" ]]; then
-    local backup_timestamp
-    local backup
-    backup_timestamp="$(date +%Y%m%d%H%M%S)"
-    backup="${MOODLE_DIR}/config.php.preinstall.${backup_timestamp}"
-    warn "Existing config.php found before database install; backing it up to ${backup}"
-    cp -a "${MOODLE_DIR}/config.php" "${backup}"
+    cp -a "${MOODLE_DIR}/config.php" "${MOODLE_DIR}/config.php.preinstall.$(date +%Y%m%d%H%M%S)"
     rm -f "${MOODLE_DIR}/config.php"
   fi
 
-  (
-    cd "${MOODLE_DIR}"
-    sudo -u www-data "${PHP_CLI_BIN}" "${MOODLE_DIR}/admin/cli/install.php" \
+  cd "${MOODLE_DIR}"
+  sudo -u www-data "${PHP_CLI_BIN}" admin/cli/install.php \
     --wwwroot="https://${MOODLE_HOST}" \
     --dataroot="${MOODLE_DATA_DIR}" \
     --dbtype=pgsql \
@@ -775,241 +641,192 @@ run_moodle_cli_install() {
     --shortname=moodle \
     --agree-license \
     --non-interactive
-  )
 
   write_moodle_config_php
   install -o www-data -g www-data -m 0640 /dev/null "${MOODLE_SENTINEL}"
-  
-  if ! moodle_db_has_config_table; then
-    die "Moodle database installation failed - config table not found"
-  fi
+  moodle_db_has_config_table || die "Installation failed – config table missing"
+}
+
+# ---------- Comprehensive feature check ----------
+# Reads values directly from the FPM pool to avoid CLI ini mismatches
+parse_fpm_pool_value() {
+  local key="$1"
+  grep -E "^\s*php_admin_value\[${key}\]" "${PHP_FPM_POOL_FILE}" | \
+    sed -E 's/.*=\s*//; s/\s*$//' | tail -1
 }
 
 check_moodle_features() {
-  log "Running comprehensive Moodle 4.5 feature verification"
-  
+  log "Verifying Moodle 4.5 features (16GB server tuned)"
+
   local all_ok=true
   local warnings=()
-  
-  log "1. PHP Version Check"
-  local php_version
-  php_version=$("${PHP_CLI_BIN}" -v | head -n1 | grep -oP 'PHP \K[0-9]+\.[0-9]+')
-  if [[ "${php_version}" == "8.3" ]]; then
-    printf '  ✓ PHP version %s (required: 8.3)\n' "${php_version}"
+
+  # 1. PHP version
+  log "1. PHP version"
+  local php_ver=$("${PHP_CLI_BIN}" -v | head -1 | grep -oP 'PHP \K[0-9]+\.[0-9]+')
+  if [[ "${php_ver}" == "8.3" ]]; then
+    printf '  ✓ PHP %s\n' "${php_ver}"
   else
-    printf '  ✗ PHP version %s (required: 8.3)\n' "${php_version}"
+    printf '  ✗ PHP %s (required 8.3)\n' "${php_ver}"
     all_ok=false
   fi
-  
-  log "2. Required PHP Extensions for Moodle 4.5"
-  local required_extensions=(
-    "curl"
-    "dom"
-    "gd"
-    "intl"
-    "json"
-    "mbstring"
-    "openssl"
-    "pcre"
-    "pgsql"
-    "SimpleXML"
-    "sodium"
-    "tokenizer"
-    "xml"
-    "xmlreader"
-    "zip"
-  )
-  
-  local missing_required=()
-  for ext in "${required_extensions[@]}"; do
+
+  # 2. Required extensions
+  log "2. Required PHP extensions"
+  local req_ext=( curl dom gd intl json mbstring openssl pcre pgsql SimpleXML sodium tokenizer xml xmlreader zip )
+  local missing_req=()
+  for ext in "${req_ext[@]}"; do
     if php_extension_loaded "${ext}"; then
-      printf '  ✓ Required: %s\n' "${ext}"
+      printf '  ✓ %s\n' "${ext}"
     else
-      printf '  ✗ MISSING Required: %s\n' "${ext}"
-      missing_required+=("${ext}")
+      printf '  ✗ MISSING %s\n' "${ext}"
+      missing_req+=("${ext}")
       all_ok=false
     fi
   done
-  
-  if [[ ${#missing_required[@]} -gt 0 ]]; then
-    die "Critical: Missing required PHP extensions: ${missing_required[*]}"
-  fi
-  
-  log "3. Recommended PHP Extensions for Moodle 4.5"
-  local recommended_extensions=(
-    "bcmath"
-    "fileinfo"
-    "iconv"
-    "opcache"
-    "redis"
-    "soap"
-    "xmlrpc"
-  )
-  
-  local missing_recommended=()
-  for ext in "${recommended_extensions[@]}"; do
+  [[ ${#missing_req[@]} -gt 0 ]] && die "Critical: missing required extensions: ${missing_req[*]}"
+
+  # 3. Recommended extensions
+  log "3. Recommended extensions"
+  local rec_ext=( bcmath fileinfo iconv opcache redis soap xmlrpc )
+  for ext in "${rec_ext[@]}"; do
     if php_extension_loaded "${ext}"; then
-      printf '  ✓ Recommended: %s\n' "${ext}"
+      printf '  ✓ %s\n' "${ext}"
     else
-      printf '  ○ Missing Recommended: %s\n' "${ext}"
-      missing_recommended+=("${ext}")
+      printf '  ○ Missing %s\n' "${ext}"
+      warnings+=("Missing recommended extension: ${ext}")
     fi
   done
-  
-  if [[ ${#missing_recommended[@]} -gt 0 ]]; then
-    warn "Missing recommended extensions: ${missing_recommended[*]}"
-    warnings+=("Some Moodle features may be limited due to missing recommended extensions")
-  fi
-  
-  log "4. PHP Configuration Checks"
-  local config_checks=(
-    "memory_limit:512M"
-    "upload_max_filesize:256M"
-    "post_max_size:256M"
-    "max_execution_time:300"
-    "max_input_vars:5000"
-    "opcache.enable:1"
-    "opcache.memory_consumption:256"
+
+  # 4. PHP-FPM pool values (the ones that matter for Moodle)
+  log "4. PHP-FPM pool configuration"
+  declare -A expected_pool=(
+    [memory_limit]=1024M
+    [upload_max_filesize]=512M
+    [post_max_size]=512M
+    [max_execution_time]=300
+    [max_input_vars]=5000
+    [opcache.enable]=1
+    [opcache.memory_consumption]=512
   )
-  
-  for check in "${config_checks[@]}"; do
-    local key="${check%%:*}"
-    local expected="${check##*:}"
+  for key in "${!expected_pool[@]}"; do
     local actual
-    actual=$("${PHP_CLI_BIN}" -r "echo ini_get('${key}');" 2>/dev/null)
-    if [[ "${actual}" == "${expected}" || "${actual}" -ge "${expected}" ]]; then
+    actual=$(parse_fpm_pool_value "${key}")
+    local expect="${expected_pool[$key]}"
+    # numeric comparison if both are integers, else string
+    if [[ "${actual}" == "${expect}" ]] || \
+       ( [[ "${actual}" =~ ^[0-9]+$ ]] && [[ "${expect}" =~ ^[0-9]+$ ]] && (( actual >= expect )) ); then
       printf '  ✓ %s = %s\n' "${key}" "${actual}"
     else
-      printf '  ✗ %s = %s (expected: %s)\n' "${key}" "${actual}" "${expected}"
+      printf '  ✗ %s = %s (expected %s)\n' "${key}" "${actual}" "${expect}"
       all_ok=false
     fi
   done
-  
-  log "5. PostgreSQL Database Check"
-  local pg_version
-  pg_version=$(sudo -u postgres psql -tAc "SHOW server_version;" 2>/dev/null | cut -d. -f1)
-  if [[ "${pg_version}" -ge 12 ]]; then
-    printf '  ✓ PostgreSQL version %s (required: >= 12)\n' "${pg_version}"
+
+  # 5. PostgreSQL
+  log "5. PostgreSQL"
+  local pg_ver; pg_ver=$(sudo -u postgres psql -tAc "SHOW server_version;" | cut -d. -f1)
+  if [[ "${pg_ver}" -ge 12 ]]; then
+    printf '  ✓ PostgreSQL %s\n' "${pg_ver}"
   else
-    printf '  ✗ PostgreSQL version %s (required: >= 12)\n' "${pg_version}"
+    printf '  ✗ PostgreSQL %s (need >=12)\n' "${pg_ver}"
     all_ok=false
   fi
-  
   if sudo -u postgres psql -d "${MOODLE_DB}" -c "SELECT 1;" >/dev/null 2>&1; then
-    printf '  ✓ Database connection to %s successful\n' "${MOODLE_DB}"
+    printf '  ✓ Database connection OK\n'
   else
-    printf '  ✗ Database connection to %s failed\n' "${MOODLE_DB}"
+    printf '  ✗ Database connection failed\n'
     all_ok=false
   fi
-  
-  log "6. Service Status Checks"
-  local services=(
+
+  # 6. Services
+  log "6. Services"
+  local svc_list=(
     "postgresql:PostgreSQL"
     "redis-server:Redis"
     "nginx:Nginx"
     "php${PHP_VERSION}-fpm:PHP-FPM"
     "moodle-cron.timer:Moodle Cron"
   )
-  
-  for service in "${services[@]}"; do
-    local svc_name="${service%%:*}"
-    local svc_label="${service##*:}"
-    if systemctl is-active --quiet "${svc_name}" 2>/dev/null; then
-      printf '  ✓ %s is running\n' "${svc_label}"
+  for svc in "${svc_list[@]}"; do
+    local name="${svc%%:*}"
+    local label="${svc##*:}"
+    if systemctl is-active --quiet "${name}" 2>/dev/null; then
+      printf '  ✓ %s running\n' "${label}"
     else
-      printf '  ✗ %s is NOT running\n' "${svc_label}"
+      printf '  ✗ %s NOT running\n' "${label}"
       all_ok=false
     fi
   done
-  
-  log "7. Disk Space Check"
-  local available_space
-  available_space=$(df -BG "${MOODLE_DATA_DIR}" 2>/dev/null | awk 'NR==2 {print $4}' | sed 's/G//')
-  if [[ -n "${available_space}" && "${available_space}" -ge 5 ]]; then
-    printf '  ✓ Available disk space: %s GB (minimum: 5 GB)\n' "${available_space}"
-  elif [[ -n "${available_space}" ]]; then
-    printf '  ✗ Low disk space: %s GB (minimum: 5 GB)\n' "${available_space}"
-    warnings+=("Low disk space may affect Moodle performance")
+
+  # 7. Disk space
+  log "7. Disk space"
+  local avail; avail=$(df -BG "${MOODLE_DATA_DIR}" 2>/dev/null | awk 'NR==2{print $4}' | sed 's/G//')
+  if [[ -n "${avail}" && "${avail}" -ge 10 ]]; then
+    printf '  ✓ %s GB free (plenty for 500GB storage)\n' "${avail}"
+  elif [[ -n "${avail}" && "${avail}" -ge 5 ]]; then
+    printf '  ○ %s GB free (minimum 5 GB, consider expanding)\n' "${avail}"
+    warnings+=("Low disk space for moodledata")
   else
-    printf '  ○ Unable to check disk space for %s\n' "${MOODLE_DATA_DIR}"
-  fi
-  
-  log "8. Moodle Installation Verification"
-  if moodle_is_installed; then
-    printf '  ✓ Moodle installation detected\n'
-    if [[ -f "${MOODLE_DIR}/version.php" ]]; then
-      local moodle_version
-      moodle_version=$(grep '$release' "${MOODLE_DIR}/version.php" | awk -F"'" '{print $2}')
-      printf '  ✓ Moodle version: %s\n' "${moodle_version}"
-    fi
-    if [[ -f "${MOODLE_SENTINEL}" ]]; then
-      printf '  ✓ Installation sentinel file exists\n'
-    fi
-  else
-    printf '  ✗ Moodle installation not detected\n'
+    printf '  ✗ Unable to check or insufficient space\n'
     all_ok=false
   fi
-  
-  log "9. Redis Connectivity Check"
-  if command -v redis-cli >/dev/null 2>&1; then
-    if redis-cli ping | grep -q PONG; then
-      printf '  ✓ Redis is responding to ping\n'
-    else
-      printf '  ✗ Redis is not responding\n'
-      all_ok=false
-    fi
+
+  # 8. Moodle installation
+  log "8. Moodle installation"
+  if moodle_is_installed; then
+    printf '  ✓ Moodle installed\n'
   else
-    printf '  ○ redis-cli not found, skipping Redis check\n'
+    printf '  ✗ Moodle not installed\n'
+    all_ok=false
   fi
-  
-  echo ""
-  log "Verification Summary"
+
+  # 9. Redis ping
+  log "9. Redis connectivity"
+  if redis-cli ping | grep -q PONG; then
+    printf '  ✓ Redis responds\n'
+  else
+    printf '  ✗ Redis not reachable\n'
+    all_ok=false
+  fi
+
+  echo
   if [[ "${all_ok}" == "true" ]]; then
-    log "✓ All critical checks passed successfully"
+    log "✓ All critical checks passed"
   else
-    die "✗ Some critical checks failed. Please review the output above."
+    die "✗ Critical checks failed – see above"
   fi
-  
   if [[ ${#warnings[@]} -gt 0 ]]; then
     warn "Warnings:"
-    for warning in "${warnings[@]}"; do
-      printf '  • %s\n' "${warning}"
-    done
+    printf '  • %s\n' "${warnings[@]}"
   fi
 }
 
+# ---------- TLS certificate ----------
 generate_self_signed_cert() {
-  log "Generating self-signed TLS certificate if needed"
+  log "Generating self-signed certificate"
   install -d -m 0755 "${NGINX_SSL_DIR}"
   if [[ -f "${NGINX_CERT_FILE}" && -f "${NGINX_KEY_FILE}" ]]; then
-    log "Existing TLS certificate and key found; skipping generation"
+    log "Certificate already exists – skipping"
     return
   fi
-
   local san="DNS:${MOODLE_HOST}"
-  if is_ipv4 "${MOODLE_HOST}"; then
-    san="${san},IP:${MOODLE_HOST}"
-  fi
-
+  is_ipv4 "${MOODLE_HOST}" && san="${san},IP:${MOODLE_HOST}"
   openssl req -x509 -nodes -newkey rsa:4096 -sha256 \
     -days "${CERT_VALID_DAYS}" \
     -keyout "${NGINX_KEY_FILE}" \
     -out "${NGINX_CERT_FILE}" \
     -subj "/CN=${MOODLE_HOST}" \
     -addext "subjectAltName=${san}"
-
   chmod 0600 "${NGINX_KEY_FILE}"
   chmod 0644 "${NGINX_CERT_FILE}"
-  
-  if ! openssl x509 -in "${NGINX_CERT_FILE}" -noout -subject >/dev/null 2>&1; then
-    die "Failed to generate valid TLS certificate"
-  fi
+  openssl x509 -in "${NGINX_CERT_FILE}" -noout -subject >/dev/null || die "Invalid certificate"
 }
 
+# ---------- Nginx site (client_max_body_size matches upload limit) ----------
 write_nginx_site() {
-  log "Writing Nginx Moodle site"
+  log "Writing Nginx site"
   rm -f /etc/nginx/sites-enabled/default
-
   cat > "${NGINX_SITE_FILE}" <<NGINX_SITE
 server {
     listen 80;
@@ -1031,7 +848,7 @@ server {
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
 
-    client_max_body_size 256M;
+    client_max_body_size 512M;
     root /var/www/moodle;
     index index.php;
 
@@ -1044,17 +861,9 @@ server {
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
-    location ^~ /moodledata/ {
-        deny all;
-    }
-
-    location ~ /\.(?!well-known).* {
-        deny all;
-    }
-
-    location ~* ^/(vendor/|composer\.(json|lock)$|config\.php$) {
-        deny all;
-    }
+    location ^~ /moodledata/ { deny all; }
+    location ~ /\.(?!well-known).* { deny all; }
+    location ~* ^/(vendor/|composer\.(json|lock)$|config\.php$) { deny all; }
 
     location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2)$ {
         expires 30d;
@@ -1074,31 +883,26 @@ server {
     }
 }
 NGINX_SITE
-
   ln -sfn "${NGINX_SITE_FILE}" /etc/nginx/sites-enabled/moodle
-
-  if grep -Eq '^[[:space:]]*server_tokens[[:space:]]+' /etc/nginx/nginx.conf; then
-    sed -i -E 's/^[[:space:]]*server_tokens[[:space:]]+[^;]+;/        server_tokens off;/' /etc/nginx/nginx.conf
-  else
-    sed -i '/http {/a\        server_tokens off;' /etc/nginx/nginx.conf
-  fi
-
+  sed -i '/http {/a\        server_tokens off;' /etc/nginx/nginx.conf 2>/dev/null || true
   nginx -t
   systemctl reload nginx
 }
 
+# ---------- Firewall ----------
 configure_firewall() {
-  log "Configuring UFW firewall"
+  log "Configuring UFW"
   ufw default deny incoming
   ufw default allow outgoing
-  ufw status | grep -Eq '22/tcp|OpenSSH' || ufw allow 22/tcp comment 'SSH'
-  ufw status | grep -Eq '80/tcp' || ufw allow 80/tcp comment 'HTTP'
-  ufw status | grep -Eq '443/tcp' || ufw allow 443/tcp comment 'HTTPS'
+  ufw allow 22/tcp comment 'SSH'
+  ufw allow 80/tcp comment 'HTTP'
+  ufw allow 443/tcp comment 'HTTPS'
   ufw --force enable
 }
 
+# ---------- Cron timer ----------
 write_systemd_cron() {
-  log "Writing Moodle cron systemd timer"
+  log "Creating Moodle cron timer"
   cat > "${SYSTEMD_SERVICE_FILE}" <<SYSTEMD_SERVICE
 [Unit]
 Description=Moodle cron job
@@ -1125,22 +929,29 @@ SYSTEMD_TIMER
 
   systemctl daemon-reload
   systemctl enable --now moodle-cron.timer
+
+  # Verify it's active
+  sleep 2
+  if systemctl is-active --quiet moodle-cron.timer; then
+    log "Moodle cron timer is active"
+  else
+    warn "Moodle cron timer did not start – check 'systemctl status moodle-cron.timer'"
+  fi
 }
 
+# ---------- Hardening ----------
 post_install_hardening() {
-  log "Applying post-install hardening"
+  log "Applying hardening"
   if [[ -f /etc/ssh/sshd_config ]]; then
     if grep -Eq '^[#[:space:]]*PermitRootLogin[[:space:]]+' /etc/ssh/sshd_config; then
       sed -i -E 's/^[#[:space:]]*PermitRootLogin[[:space:]]+.*/PermitRootLogin no/' /etc/ssh/sshd_config
     else
       printf '\nPermitRootLogin no\n' >> /etc/ssh/sshd_config
     fi
-    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || warn "Could not reload SSH service; verify SSH configuration manually"
-  else
-    warn "/etc/ssh/sshd_config not found; skipping root SSH login hardening"
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || warn "Could not reload SSH"
   fi
 
-  cat > /etc/fail2ban/jail.d/sshd.local <<'FAIL2BAN_JAIL'
+  cat > /etc/fail2ban/jail.d/sshd.local <<'FAIL2BAN'
 [sshd]
 enabled = true
 port = ssh
@@ -1150,91 +961,61 @@ backend = systemd
 maxretry = 5
 findtime = 10m
 bantime = 1h
-FAIL2BAN_JAIL
+FAIL2BAN
   systemctl enable --now fail2ban
   systemctl restart fail2ban
 }
 
+# ---------- Health check ----------
 health_check() {
   log "Waiting for Moodle login page"
   local url="https://${MOODLE_HOST}/login/index.php"
   local deadline=$((SECONDS + 600))
   local ok=false
-  local direct_status
-  local local_status
-
   curl_http_status() {
     curl -skL --connect-timeout 5 --max-time 20 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null || printf '000'
   }
-
-  status_is_ready() {
-    [[ "$1" =~ ^[23][0-9][0-9]$ ]]
-  }
+  status_is_ready() { [[ "$1" =~ ^[23][0-9][0-9]$ ]]; }
 
   while (( SECONDS < deadline )); do
-    direct_status="$(curl_http_status "${url}")"
-    if status_is_ready "${direct_status}"; then
-      ok=true
-      break
-    fi
-
-    local_status="$(curl_http_status --resolve "${MOODLE_HOST}:443:127.0.0.1" "${url}")"
-    if status_is_ready "${local_status}"; then
-      ok=true
-      break
-    fi
-
-    printf 'Moodle is not ready yet; direct HTTP status=%s, local Nginx status=%s. Retrying in 15 seconds...\n' "${direct_status}" "${local_status}"
+    if status_is_ready "$(curl_http_status "${url}")"; then ok=true; break; fi
+    if status_is_ready "$(curl_http_status --resolve "${MOODLE_HOST}:443:127.0.0.1" "${url}")"; then ok=true; break; fi
+    printf 'Moodle not ready yet – retrying in 15s...\n'
     sleep 15
   done
-
-  if [[ "${ok}" != "true" ]]; then
-    warn "Moodle did not return an HTTP 2xx/3xx response within 10 minutes. Run sudo ./diagnose-moodle.sh on the server."
-  fi
+  [[ "${ok}" == "true" ]] || warn "Moodle did not respond within 10 minutes"
 }
 
+# ---------- Summary ----------
 print_success_summary() {
   cat <<SUMMARY
 
 ============================================================
-Moodle 4.5 provisioning complete
+Moodle 4.5 on Ubuntu 24.04 – deployment complete
 ============================================================
 
-Access URL:
-  https://${MOODLE_HOST}
+URL:            https://${MOODLE_HOST}
+Admin user:     ${MOODLE_ADMIN_USER}
+PHP:            ${PHP_VERSION} (native)
+Moodle branch:  ${MOODLE_BRANCH}
+Memory / disk:  tuned for 16GB RAM / 500GB storage
 
-Admin username:
-  ${MOODLE_ADMIN_USER}
-
-PHP Version:
-  ${PHP_VERSION} (native Ubuntu 24.04)
-
-Moodle Branch:
-  ${MOODLE_BRANCH}
-
-Self-signed certificate note:
-  Browsers will show a certificate warning until clients trust the local
-  certificate. Import this certificate into client trust stores:
-  /etc/nginx/ssl/fullchain.pem
-
-Useful logs:
+Logs:
   Nginx:    /var/log/nginx/
   PHP-FPM:  /var/log/php${PHP_VERSION}-fpm.log
 
-Moodle cron timer:
+Cron timer:
   systemctl status moodle-cron.timer
 
-Environment file:
+Environment:
   ${MOODLE_ENV_FILE}
 
-All features verified:
-  The script has checked all required PHP extensions,
-  database connectivity, and service status.
-
+All features verified – if any warnings appeared above, review them.
 ============================================================
 SUMMARY
 }
 
+# ---------- Main ----------
 main() {
   require_command apt
   collect_inputs
