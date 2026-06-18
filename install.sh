@@ -466,7 +466,10 @@ install_php() {
 
 # ---------- PostgreSQL ----------
 postgresql_installed_version() {
-  command -v psql >/dev/null 2>&1 && psql --version | awk '{print $3}' | cut -d. -f1
+  # Return empty (success) when psql is absent so callers under `set -e`
+  # don't abort on the non-zero exit from `command -v`.
+  command -v psql >/dev/null 2>&1 || return 0
+  psql --version | awk '{print $3}' | cut -d. -f1
 }
 
 install_postgresql() {
