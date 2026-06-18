@@ -340,12 +340,15 @@ ensure_opcache_both_sapis() {
   # Enable via phpenmod (should create symlinks in both SAPI conf.d)
   phpenmod -v "${PHP_VERSION}" opcache
 
-  # If CLI still doesn't see it, manually copy the FPM ini if available
+  # If CLI still doesn't see it, manually copy the FPM ini if available.
+  # On Debian/Ubuntu these are symlinks into mods-available, so the FPM and
+  # CLI inis can resolve to the same file – skip the copy in that case.
   if ! php_extension_loaded "opcache"; then
-    if [[ -f "${fpm_ini}" ]]; then
+    local cli_ini="${cli_conf}/10-opcache.ini"
+    if [[ -f "${fpm_ini}" && ! "${fpm_ini}" -ef "${cli_ini}" ]]; then
       cp "${fpm_ini}" "${cli_conf}/"
       log "Copied opcache INI from FPM to CLI"
-    else
+    elif [[ ! -e "${cli_ini}" ]]; then
       # Last resort: create a minimal ini
       echo "extension=opcache.so" > "${cli_conf}/20-opcache.ini"
     fi
