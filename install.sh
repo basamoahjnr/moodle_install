@@ -942,9 +942,8 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name ${MOODLE_HOST};
 
     ssl_certificate /etc/nginx/ssl/fullchain.pem;
