@@ -36,6 +36,7 @@ MOODLE_DB=""
 MOODLE_DB_USER=""
 MOODLE_DB_PASS=""
 CERT_VALID_DAYS=""
+MOODLE_PRESET=""
 
 log() {
   printf '\n\033[1;34m==>\033[0m %s\n' "$*"
@@ -122,6 +123,12 @@ read_required() {
           printf 'Use a valid email address.\n'
           continue
         fi
+        ;;
+      preset)
+        case "${value,,}" in
+          starter|full|none) value="${value,,}" ;;
+          *) printf "Enter 'full', 'starter', or 'none'.\n"; continue ;;
+        esac
         ;;
     esac
 
@@ -236,6 +243,12 @@ validate_existing_inputs() {
     warn "MOODLE_ADMIN_PASS does not meet Moodle's password policy."
     MOODLE_ADMIN_PASS=""; valid=false
   fi
+  if [[ -n "${MOODLE_PRESET}" ]]; then
+    case "${MOODLE_PRESET,,}" in
+      starter|full|none) MOODLE_PRESET="${MOODLE_PRESET,,}" ;;
+      *) warn "MOODLE_PRESET must be 'full', 'starter', or 'none'."; MOODLE_PRESET=""; valid=false ;;
+    esac
+  fi
   [[ "${valid}" == "true" ]]
 }
 
@@ -243,7 +256,7 @@ collect_inputs() {
   load_local_env_if_present
   validate_existing_inputs || true
 
-  if [[ -n "${MOODLE_HOST}" && -n "${MOODLE_SITE_NAME}" && -n "${MOODLE_ADMIN_USER}" && -n "${MOODLE_ADMIN_PASS}" && -n "${MOODLE_ADMIN_EMAIL}" && -n "${MOODLE_DB}" && -n "${MOODLE_DB_USER}" && -n "${MOODLE_DB_PASS}" && -n "${CERT_VALID_DAYS}" ]]; then
+  if [[ -n "${MOODLE_HOST}" && -n "${MOODLE_SITE_NAME}" && -n "${MOODLE_ADMIN_USER}" && -n "${MOODLE_ADMIN_PASS}" && -n "${MOODLE_ADMIN_EMAIL}" && -n "${MOODLE_DB}" && -n "${MOODLE_DB_USER}" && -n "${MOODLE_DB_PASS}" && -n "${CERT_VALID_DAYS}" && -n "${MOODLE_PRESET}" ]]; then
     log "Using complete settings from ${LOCAL_ENV_FILE}"
     return
   fi
@@ -258,6 +271,7 @@ collect_inputs() {
   [[ -n "${MOODLE_DB_USER}" ]] || read_required "MOODLE_DB_USER" "PostgreSQL username" "Database role." "moodle" "pg_identifier"
   [[ -n "${MOODLE_DB_PASS}" ]] || read_secret_confirm "MOODLE_DB_PASS" "PostgreSQL password" "Password for the role."
   [[ -n "${CERT_VALID_DAYS}" ]] || read_required "CERT_VALID_DAYS" "Certificate validity days" "Number of days for the self-signed cert." "3650" "positive_integer"
+  [[ -n "${MOODLE_PRESET}" ]] || read_required "MOODLE_PRESET" "Site admin preset" "Admin preset applied during install: 'full', 'starter', or 'none'." "full" "preset"
 }
 
 write_env_files() {
@@ -274,6 +288,7 @@ write_env_files() {
     printf 'MOODLE_DB_USER=%s\n' "$(escape_env_value "${MOODLE_DB_USER}")"
     printf 'MOODLE_DB_PASS=%s\n' "$(escape_env_value "${MOODLE_DB_PASS}")"
     printf 'CERT_VALID_DAYS=%s\n' "$(escape_env_value "${CERT_VALID_DAYS}")"
+    printf 'MOODLE_PRESET=%s\n' "$(escape_env_value "${MOODLE_PRESET}")"
   } > "${MOODLE_ENV_FILE}"
   chown root:www-data "${MOODLE_ENV_FILE}"
   chmod 0640 "${MOODLE_ENV_FILE}"
@@ -294,6 +309,8 @@ MOODLE_DB_USER="moodle"
 MOODLE_DB_PASS="ChangeMe-With-A-Strong-Database-Password1!"
 # Certificate
 CERT_VALID_DAYS="3650"
+# Site admin preset applied during install: "full", "starter", or "none"
+MOODLE_PRESET="full"
 ENV_EXAMPLE
   chown root:root "${MOODLE_ENV_EXAMPLE}"
   chmod 0644 "${MOODLE_ENV_EXAMPLE}"
@@ -686,6 +703,13 @@ run_moodle_cli_install() {
     rm -f "${MOODLE_DIR}/config.php"
   fi
 
+  # Apply the chosen admin preset during install (skip when "none"/empty).
+  local preset_args=()
+  if [[ -n "${MOODLE_PRESET}" && "${MOODLE_PRESET}" != "none" ]]; then
+    preset_args+=(--sitepreset="${MOODLE_PRESET}")
+    log "Applying '${MOODLE_PRESET}' site admin preset during install"
+  fi
+
   cd "${MOODLE_DIR}"
   sudo -u www-data "${PHP_CLI_BIN}" admin/cli/install.php \
     --wwwroot="https://${MOODLE_HOST}" \
@@ -700,6 +724,7 @@ run_moodle_cli_install() {
     --adminemail="${MOODLE_ADMIN_EMAIL}" \
     --fullname="${MOODLE_SITE_NAME}" \
     --shortname=moodle \
+    "${preset_args[@]}" \
     --agree-license \
     --non-interactive
 
@@ -974,7 +999,11 @@ server {
     location ~ /\.(?!well-known).* { deny all; }
     location ~* ^/(vendor/|composer\.(json|lock)$|config\.php$) { deny all; }
 
-    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2)$ {
+    # Cache genuinely static files, but NOT Moodle's PHP-served assets
+    # (e.g. /theme/font.php/.../x.woff2, /pluginfile.php/.../x.png). The
+    # negative lookahead excludes any path containing .php so those fall
+    # through to the PHP handler instead of being 404'd as missing files.
+    location ~* ^(?!.*\.php(/|\$)).+\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2)$ {
         expires 30d;
         access_log off;
         try_files \$uri =404;

@@ -65,10 +65,12 @@ psql_admin() { sudo -u postgres psql -v ON_ERROR_STOP=1 "$@"; }
 OLD_HOST=""
 OLD_DB=""
 OLD_DB_USER=""
+OLD_PRESET=""
 if [[ -f "${MOODLE_ENV_FILE}" ]]; then
   OLD_HOST="$( . "${MOODLE_ENV_FILE}"; printf '%s' "${MOODLE_HOST:-}" )"
   OLD_DB="$( . "${MOODLE_ENV_FILE}"; printf '%s' "${MOODLE_DB:-}" )"
   OLD_DB_USER="$( . "${MOODLE_ENV_FILE}"; printf '%s' "${MOODLE_DB_USER:-}" )"
+  OLD_PRESET="$( . "${MOODLE_ENV_FILE}"; printf '%s' "${MOODLE_PRESET:-}" )"
 fi
 
 set -a
@@ -80,6 +82,13 @@ for req in MOODLE_HOST MOODLE_SITE_NAME MOODLE_ADMIN_USER MOODLE_ADMIN_PASS \
            MOODLE_ADMIN_EMAIL MOODLE_DB MOODLE_DB_USER MOODLE_DB_PASS CERT_VALID_DAYS; do
   [[ -n "${!req:-}" ]] || die "Missing required setting in .env: ${req}"
 done
+
+# MOODLE_PRESET is optional; default to "full". Validate if present.
+MOODLE_PRESET="${MOODLE_PRESET:-full}"
+case "${MOODLE_PRESET,,}" in
+  starter|full|none) MOODLE_PRESET="${MOODLE_PRESET,,}" ;;
+  *) die "MOODLE_PRESET must be 'full', 'starter', or 'none'." ;;
+esac
 
 # Refuse the unsafe renames rather than silently breaking the install.
 if [[ -n "${OLD_DB}" && "${OLD_DB}" != "${MOODLE_DB}" ]]; then
@@ -103,6 +112,7 @@ umask 027
   printf 'MOODLE_DB_USER=%s\n'     "$(escape_env_value "${MOODLE_DB_USER}")"
   printf 'MOODLE_DB_PASS=%s\n'     "$(escape_env_value "${MOODLE_DB_PASS}")"
   printf 'CERT_VALID_DAYS=%s\n'    "$(escape_env_value "${CERT_VALID_DAYS}")"
+  printf 'MOODLE_PRESET=%s\n'      "$(escape_env_value "${MOODLE_PRESET}")"
 } > "${MOODLE_ENV_FILE}"
 chown root:www-data "${MOODLE_ENV_FILE}"
 chmod 0640 "${MOODLE_ENV_FILE}"
@@ -151,6 +161,14 @@ if nginx -t 2>/dev/null; then
   systemctl reload nginx
 else
   warn "nginx config test failed – not reloading; run 'nginx -t' to inspect"
+fi
+
+# ---- 5b. Site admin preset (install-time only – cannot re-apply via CLI) -----
+# Moodle applies a preset only during initial install (--sitepreset). There is
+# no supported CLI to apply one to a running site, so reapply just records the
+# value and tells you how to apply it if it changed.
+if [[ "${MOODLE_PRESET}" != "none" && "${MOODLE_PRESET}" != "${OLD_PRESET}" ]]; then
+  warn "MOODLE_PRESET changed (${OLD_PRESET:-unset} -> ${MOODLE_PRESET}). Moodle only applies presets at install time, so this is NOT auto-applied. To apply now: Site administration -> Site admin presets -> Apply '${MOODLE_PRESET}'."
 fi
 
 # ---- 6. Purge Moodle caches so changes show immediately ---------------------
