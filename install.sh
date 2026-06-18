@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -324,6 +323,43 @@ php_extension_loaded() {
   "${PHP_CLI_BIN}" -m 2>/dev/null | grep -Eiq "^${extension}$"
 }
 
+# Ensures opcache is present for CLI and FPM (not just FPM)
+ensure_opcache_both_sapis() {
+  local cli_conf="/etc/php/${PHP_VERSION}/cli/conf.d"
+  local fpm_ini="/etc/php/${PHP_VERSION}/fpm/conf.d/10-opcache.ini"
+
+  if php_extension_loaded "opcache"; then
+    log "opcache already loaded"
+    return
+  fi
+
+  log "Enabling opcache for both CLI and FPM"
+  # Install package if needed
+  apt install -y "php${PHP_VERSION}-opcache" 2>/dev/null || true
+
+  # Enable via phpenmod (should create symlinks in both SAPI conf.d)
+  phpenmod -v "${PHP_VERSION}" opcache
+
+  # If CLI still doesn't see it, manually copy the FPM ini if available
+  if ! php_extension_loaded "opcache"; then
+    if [[ -f "${fpm_ini}" ]]; then
+      cp "${fpm_ini}" "${cli_conf}/"
+      log "Copied opcache INI from FPM to CLI"
+    else
+      # Last resort: create a minimal ini
+      echo "extension=opcache.so" > "${cli_conf}/20-opcache.ini"
+    fi
+  fi
+
+  # Restart FPM so that both SAPIs are consistent
+  systemctl restart "php${PHP_VERSION}-fpm" || true
+  if php_extension_loaded "opcache"; then
+    log "opcache is now loaded"
+  else
+    warn "Could not load opcache for CLI – this is not critical for Moodle"
+  fi
+}
+
 install_php() {
   log "Installing PHP ${PHP_VERSION} + Moodle extensions"
 
@@ -331,7 +367,7 @@ install_php() {
     die "PHP ${PHP_VERSION} packages not available. Ubuntu 24.04 should provide them."
   fi
 
-  # Required extensions (sodium, json, etc. are built-in)
+  # Required packages (sodium, json, etc. are built-in)
   local required_packages=(
     "php${PHP_VERSION}-cli"
     "php${PHP_VERSION}-fpm"
@@ -344,9 +380,9 @@ install_php() {
     "php${PHP_VERSION}-zip"
   )
 
+  # Recommended packages (opcache handled separately)
   local recommended_packages=(
     "php${PHP_VERSION}-bcmath"
-    "php${PHP_VERSION}-opcache"
     "php${PHP_VERSION}-redis"
     "php${PHP_VERSION}-soap"
     "php${PHP_VERSION}-xmlrpc"
@@ -364,19 +400,8 @@ install_php() {
     fi
   done
 
-  # Force-enable opcache because the package sometimes doesn't enable the module automatically
-  if php_extension_loaded "opcache"; then
-    log "opcache already loaded"
-  else
-    if apt-cache show "php${PHP_VERSION}-opcache" >/dev/null 2>&1; then
-      apt install -y "php${PHP_VERSION}-opcache"
-      phpenmod -v "${PHP_VERSION}" opcache
-      systemctl restart "php${PHP_VERSION}-fpm"
-    fi
-    if ! php_extension_loaded "opcache"; then
-      warn "opcache still not loaded – try restarting PHP-FPM manually"
-    fi
-  fi
+  # Handle opcache specifically – must work for CLI checks
+  ensure_opcache_both_sapis
 
   # Verify required extensions
   log "Verifying required extensions for Moodle 4.5"
@@ -490,7 +515,8 @@ install_nginx() {
   log "Installing Nginx"
   apt install -y nginx 2>/dev/null || true
   systemctl enable --now nginx
-  nginx -t
+  # Test before reload
+  nginx -t || die "Nginx configuration is broken (before Moodle site added)"
   systemctl reload nginx
 }
 
@@ -661,7 +687,7 @@ run_moodle_cli_install() {
   moodle_db_has_config_table || die "Installation failed – config table missing"
 }
 
-# ---------- Cron timer (fixed service unit) ----------
+# ---------- Cron timer (clean service unit) ----------
 write_systemd_cron() {
   log "Creating Moodle cron timer"
 
@@ -696,7 +722,6 @@ SYSTEMD_TIMER
   systemctl daemon-reload
   systemctl enable --now moodle-cron.timer
 
-  # Verify immediately
   sleep 2
   if systemctl is-active --quiet moodle-cron.timer; then
     log "Moodle cron timer is active"
@@ -706,7 +731,6 @@ SYSTEMD_TIMER
 }
 
 # ---------- Comprehensive feature check ----------
-# Reads FPM pool values directly (not CLI ini) to avoid mismatches.
 parse_fpm_pool_value() {
   local key="$1"
   grep -E "^\s*php_admin_value\[${key}\]" "${PHP_FPM_POOL_FILE}" | \
@@ -871,10 +895,12 @@ generate_self_signed_cert() {
   openssl x509 -in "${NGINX_CERT_FILE}" -noout -subject >/dev/null || die "Invalid certificate"
 }
 
-# ---------- Nginx site (http2 fixed) ----------
+# ---------- Nginx site (old file deleted, recreated correctly) ----------
 write_nginx_site() {
-  log "Writing Nginx site"
-  rm -f /etc/nginx/sites-enabled/default
+  log "Writing Nginx site (old configuration deleted)"
+  # Remove any previous Moodle site files
+  rm -f "${NGINX_SITE_FILE}" /etc/nginx/sites-enabled/moodle /etc/nginx/sites-enabled/default
+
   cat > "${NGINX_SITE_FILE}" <<NGINX_SITE
 server {
     listen 80;
@@ -930,10 +956,17 @@ server {
     }
 }
 NGINX_SITE
+
   ln -sfn "${NGINX_SITE_FILE}" /etc/nginx/sites-enabled/moodle
-  sed -i '/http {/a\        server_tokens off;' /etc/nginx/nginx.conf 2>/dev/null || true
+
+  # Hide Nginx version
+  if ! grep -q 'server_tokens off;' /etc/nginx/nginx.conf; then
+    sed -i '/http {/a\        server_tokens off;' /etc/nginx/nginx.conf
+  fi
+
   nginx -t
   systemctl reload nginx
+  log "Nginx configuration applied successfully"
 }
 
 # ---------- Firewall ----------
@@ -1023,7 +1056,7 @@ All features verified – if any warnings appeared above, review them.
 SUMMARY
 }
 
-# ---------- Main (order fixed: cron before feature check) ----------
+# ---------- Main (order corrected) ----------
 main() {
   require_command apt
   collect_inputs
@@ -1038,8 +1071,8 @@ main() {
   setup_moodle_code
   write_php_fpm_pool
   run_moodle_cli_install
-  write_systemd_cron            # cron timer created & started here
-  check_moodle_features         # now it will find the timer active
+  write_systemd_cron
+  check_moodle_features
   generate_self_signed_cert
   write_nginx_site
   configure_firewall
