@@ -903,14 +903,18 @@ configure_firewall() {
 # ---------- Cron timer ----------
 write_systemd_cron() {
   log "Creating Moodle cron timer"
-  cat > "${SYSTEMD_SERVICE_FILE}" <<SYSTEMD_SERVICE
+cat > "${SYSTEMD_SERVICE_FILE}" <<SYSTEMD_SERVICE
 [Unit]
 Description=Moodle cron job
 After=network.target postgresql.service redis-server.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/sudo -u www-data /usr/bin/${PHP_CLI_BIN} /var/www/moodle/admin/cli/cron.php
+User=www-data
+Group=www-data
+ExecStart=/usr/bin/${PHP_CLI_BIN} /var/www/moodle/admin/cli/cron.php
+Nice=10
+IOSchedulingClass=idle
 SYSTEMD_SERVICE
 
   cat > "${SYSTEMD_TIMER_FILE}" <<'SYSTEMD_TIMER'
@@ -1030,11 +1034,11 @@ main() {
   setup_moodle_code
   write_php_fpm_pool
   run_moodle_cli_install
+  write_systemd_cron
   check_moodle_features
   generate_self_signed_cert
   write_nginx_site
   configure_firewall
-  write_systemd_cron
   post_install_hardening
   health_check
   print_success_summary
